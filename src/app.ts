@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import adminRouter from './routes/admin.js';
-import routes from './routes/index.js';
+import { createApiRouter } from './routes/index.js';
 import { pool } from './db.js';
 import {
   InMemoryUsageEventsRepository,
@@ -34,6 +34,7 @@ import { VaultController } from './controllers/vaultController.js';
 import { TransactionBuilderService } from './services/transactionBuilder.js';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { requestLogger } from './middleware/logging.js';
+import { createConfiguredRestRateLimitMiddleware } from './middleware/restRateLimit.js';
 import { metricsMiddleware, metricsEndpoint } from './metrics.js';
 import {
   BadRequestError,
@@ -73,6 +74,7 @@ const parseDate = (value: unknown): Date | null => {
 
 export const createApp = (dependencies?: Partial<AppDependencies>) => {
   const app = express();
+  const restRateLimit = createConfiguredRestRateLimitMiddleware();
   
   // Set database pool in locals for billing routes
   app.locals.dbPool = pool;
@@ -253,8 +255,13 @@ export const createApp = (dependencies?: Partial<AppDependencies>) => {
   // Prometheus metrics endpoint — auth-gated in production
   app.get('/api/metrics', metricsEndpoint);
 
+  app.use('/api/usage', restRateLimit);
+  app.use('/api/developers', restRateLimit);
+  app.use('/api/vault', restRateLimit);
+  app.use('/api/keys', restRateLimit);
+
   // Mount all routes including billing
-  app.use('/api', routes);
+  app.use('/api', createApiRouter({ restRateLimit }));
 
 
   app.get('/api/apis', async (req, res) => {

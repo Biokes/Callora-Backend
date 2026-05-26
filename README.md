@@ -29,6 +29,16 @@ The gateway auth middleware performs prefix-based lookup, timing-safe full-key h
 
 See [docs/gateway-api-key-auth.md](./docs/gateway-api-key-auth.md) for the full flow, attached request fields, and failure responses.
 
+## API key management
+
+Authenticated developers can manage API keys for their own APIs through:
+
+- `POST /api/apis/:apiId/keys` to create a key
+- `GET /api/apis/:apiId/keys` to list keys with masked values and revoked status
+- `DELETE /api/keys/:id` to revoke a key
+
+The plaintext API key is returned only at creation time. Subsequent list responses expose only the stored prefix and a masked display value.
+
 ## Vault repository behavior
 
 - Enforces one vault per user per network.

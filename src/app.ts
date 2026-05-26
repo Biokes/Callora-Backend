@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import adminRouter from './routes/admin.js';
-import routes from './routes/index.js';
+import { createRoutes } from './routes/index.js';
 import { pool } from './db.js';
 import {
   InMemoryUsageEventsRepository,
@@ -42,7 +42,6 @@ import {
   NotFoundError,
   UnauthorizedError,
 } from './errors/index.js';
-import { apiKeyRepository } from './repositories/apiKeyRepository.js';
 
 interface AppDependencies {
   usageEventsRepository?: UsageEventsRepository;
@@ -73,6 +72,10 @@ const parseDate = (value: unknown): Date | null => {
 
 export const createApp = (dependencies?: Partial<AppDependencies>) => {
   const app = express();
+  const routes = createRoutes({
+    apiRepository: dependencies?.apiRepository ?? defaultApiRepository,
+    developerRepository: dependencies?.developerRepository ?? defaultDeveloperRepository,
+  });
   
   // Set database pool in locals for billing routes
   app.locals.dbPool = pool;
@@ -560,25 +563,6 @@ export const createApp = (dependencies?: Partial<AppDependencies>) => {
   // Vault balance endpoint
   app.get('/api/vault/balance', requireAuth, (req, res: express.Response<unknown, AuthenticatedLocals>) => {
     vaultController.getBalance(req, res);
-  });
-
-  // Revoke API key endpoint
-  app.delete('/api/keys/:id', requireAuth, (req, res: express.Response<unknown, AuthenticatedLocals>, next) => {
-    const user = res.locals.authenticatedUser;
-    if (!user) {
-      next(new UnauthorizedError());
-      return;
-    }
-
-    const { id } = req.params;
-    const result = apiKeyRepository.revoke(id, user.id);
-
-    if (result === 'forbidden') {
-      next(new ForbiddenError());
-      return;
-    }
-
-    res.status(204).send();
   });
 
   /**

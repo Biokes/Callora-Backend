@@ -1,4 +1,10 @@
-import type { Request, Response } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import {
+  InternalServerError,
+  NotFoundError,
+  UnauthorizedError,
+  isAppError,
+} from '../errors/index.js';
 import type { AuthenticatedLocals } from '../middleware/requireAuth.js';
 import type { VaultRepository } from '../repositories/vaultRepository.js';
 
@@ -7,24 +13,26 @@ export class VaultController {
 
   async getBalance(
     req: Request,
-    res: Response<unknown, AuthenticatedLocals>
+    res: Response<unknown, AuthenticatedLocals>,
+    next: NextFunction,
   ): Promise<void> {
+    const user = res.locals.authenticatedUser;
+    if (!user) {
+      next(new UnauthorizedError('Authentication required'));
+      return;
+    }
+
+    const network = (req.query.network as string) ?? 'testnet';
+
     try {
-      const user = res.locals.authenticatedUser;
-      if (!user) {
-        res.status(401).json({ error: 'Authentication required' });
-        return;
-      }
-
-      const network = (req.query.network as string) ?? 'testnet';
-      if (network !== 'testnet' && network !== 'mainnet') {
-        res.status(400).json({ error: 'network must be either "testnet" or "mainnet"' });
-        return;
-      }
-
       const vault = await this.vaultRepository.findByUserId(user.id, network);
       if (!vault) {
-        res.status(404).json({ error: `Vault not found for user on network '${network}'. Please create a vault first.` });
+        next(
+          new NotFoundError(
+            `Vault not found for user on network '${network}'. Please create a vault first.`,
+            'VAULT_NOT_FOUND',
+          ),
+        );
         return;
       }
 
@@ -38,8 +46,14 @@ export class VaultController {
         lastSyncedAt: vault.lastSyncedAt ? vault.lastSyncedAt.toISOString() : null
       });
     } catch (error) {
-      console.error('Failed to get vault balance:', error);
-      res.status(500).json({ error: 'Failed to retrieve vault balance' });
+      next(
+        isAppError(error)
+          ? error
+          : new InternalServerError(
+              'Failed to retrieve vault balance',
+              'VAULT_BALANCE_RETRIEVAL_FAILED',
+            ),
+      );
     }
   }
 

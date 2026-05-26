@@ -192,4 +192,11 @@ Notes:
 - Deposit transaction building defaults to a `100` stroop fee and a `300` second timeout unless overridden.
 - Soroban settlement client uses the configured network RPC URL and settlement contract ID.
 
+### Stellar-aware route params
+
+- `GET /api/vault/balance` accepts an optional `network` query param.
+- Accepted values are `testnet` and `mainnet`.
+- When omitted, the route defaults `network` to `testnet`.
+- Invalid values are rejected consistently with a `400` validation response.
+
 This repo is part of [Callora](https://github.com/your-org/callora). Frontend: `callora-frontend`. Contracts: `callora-contracts`.

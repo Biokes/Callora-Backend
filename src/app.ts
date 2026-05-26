@@ -24,6 +24,7 @@ import {
 import { apiStatusEnum, type ApiStatus, httpMethodEnum } from './db/schema.js';
 import type { Developer } from './db/schema.js';
 import { requireAuth, type AuthenticatedLocals } from './middleware/requireAuth.js';
+import { validate } from './middleware/validate.js';
 import { buildDeveloperAnalytics } from './services/developerAnalytics.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { performHealthCheck, type HealthCheckConfig } from './services/healthCheck.js';
@@ -43,6 +44,7 @@ import {
   UnauthorizedError,
 } from './errors/index.js';
 import { apiKeyRepository } from './repositories/apiKeyRepository.js';
+import { stellarNetworkQuerySchema } from './validators/networkSchema.js';
 
 interface AppDependencies {
   usageEventsRepository?: UsageEventsRepository;
@@ -557,8 +559,17 @@ export const createApp = (dependencies?: Partial<AppDependencies>) => {
     depositController.prepareDeposit(req, res);
   });
 
+  /**
+   * GET /api/vault/balance
+   *
+   * Returns the authenticated user's vault balance for the requested Stellar network.
+   *
+   * Query params:
+   *   network - optional Stellar network identifier (`testnet` or `mainnet`)
+   *             default: `testnet`
+   */
   // Vault balance endpoint
-  app.get('/api/vault/balance', requireAuth, (req, res: express.Response<unknown, AuthenticatedLocals>) => {
+  app.get('/api/vault/balance', requireAuth, validate({ query: stellarNetworkQuerySchema }), (req, res: express.Response<unknown, AuthenticatedLocals>) => {
     vaultController.getBalance(req, res);
   });
 

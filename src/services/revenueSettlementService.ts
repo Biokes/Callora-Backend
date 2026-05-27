@@ -2,16 +2,33 @@ import { Settlement, SettlementStore } from '../types/developer.js';
 import { ApiRegistry, UsageEvent, UsageStore } from '../types/gateway.js';
 import { SorobanSettlementClient } from './sorobanSettlement.js';
 import { randomUUID } from 'node:crypto';
+import { config } from '../config/index.js';
+import {
+  RETRIABLE_HTTP_STATUSES,
+  TransientError,
+  isTransientNetworkError,
+  withRetry,
+} from '../lib/retry.js';
 
 export interface RevenueSettlementOptions {
   /** Minimum accumulated USDC to trigger a payout (default: 5.00) */
   minPayoutUsdc?: number;
   /** Maximum number of events to process per developer per batch (to avoid hitting transaction limits) */
   maxEventsPerBatch?: number;
+  horizonUrl?: string;
+  fetchImpl?: typeof fetch;
+  horizonRequestTimeoutMs?: number;
+  horizonMaxRetries?: number;
+  horizonRetryBaseDelayMs?: number;
+}
+
+interface HorizonTransactionResponse {
+  successful?: boolean;
 }
 
 export class RevenueSettlementService {
   private batchTail: Promise<void> = Promise.resolve();
+  private reconcileTail: Promise<void> = Promise.resolve();
 
   constructor(
     private usageStore: UsageStore,

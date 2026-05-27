@@ -121,6 +121,23 @@ if (isDirectExecution) {
   const usageStore = createPostgresUsageStore(pool);
   const settlementStore = createPostgresSettlementStore(pool);
   const registry = createApiRegistry();
+  const revenueSettlementService = new RevenueSettlementService(
+    usageStore,
+    settlementStore,
+    registry,
+    {
+      distribute: async () => ({
+        success: false,
+        error: 'Runtime settlement distribution is not configured in this process',
+      }),
+    },
+    {
+      horizonRequestTimeoutMs: config.settlementSync.timeoutMs,
+    },
+  );
+  const settlementStatusSyncJob = createSettlementStatusSyncJob(revenueSettlementService, {
+    intervalMs: config.settlementSync.intervalMs,
+  });
 
   const apiKeys = new Map<string, ApiKey>([
     ['test-key-1', { key: 'test-key-1', developerId: 'dev_001', apiId: 'api_001' }],
@@ -166,6 +183,7 @@ if (isDirectExecution) {
   const PORT = config.port;
 
   const closeAllDataResources = async () => {
+    settlementStatusSyncJob.stop();
     await closeDb();
     await Promise.allSettled([
       closePgPool(),
@@ -178,6 +196,7 @@ if (isDirectExecution) {
   async function startServer() {
     try {
       await initializeDb();
+      settlementStatusSyncJob.start();
       
       const server = app.listen(PORT, () => {
         console.log(`Callora backend listening on http://localhost:${PORT}`);

@@ -7,6 +7,7 @@ export interface Settlement {
   status: 'pending' | 'completed' | 'failed';
   tx_hash: string | null;
   created_at: string; // ISO-8601
+  completed_at?: string | null;
 }
 
 export interface RevenueSummary {

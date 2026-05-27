@@ -476,8 +476,17 @@ export const createApp = (dependencies?: Partial<AppDependencies>) => {
     depositController.prepareDeposit(req, res);
   });
 
+  /**
+   * GET /api/vault/balance
+   *
+   * Returns the authenticated user's vault balance for the requested Stellar network.
+   *
+   * Query params:
+   *   network - optional Stellar network identifier (`testnet` or `mainnet`)
+   *             default: `testnet`
+   */
   // Vault balance endpoint
-  app.get('/api/vault/balance', requireAuth, (req, res: express.Response<unknown, AuthenticatedLocals>) => {
+  app.get('/api/vault/balance', requireAuth, validate({ query: stellarNetworkQuerySchema }), (req, res: express.Response<unknown, AuthenticatedLocals>) => {
     vaultController.getBalance(req, res);
   });
 

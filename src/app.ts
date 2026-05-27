@@ -36,6 +36,7 @@ import { VaultController } from './controllers/vaultController.js';
 import { TransactionBuilderService } from './services/transactionBuilder.js';
 import { requestIdMiddleware } from './middleware/requestId.js';
 import { requestLogger } from './middleware/logging.js';
+import { createConfiguredRestRateLimitMiddleware } from './middleware/restRateLimit.js';
 import { metricsMiddleware, metricsEndpoint } from './metrics.js';
 import {
   BadRequestError,
@@ -76,6 +77,7 @@ const parseDate = (value: unknown): Date | null => {
 
 export const createApp = (dependencies?: Partial<AppDependencies>) => {
   const app = express();
+  const restRateLimit = createConfiguredRestRateLimitMiddleware();
   
   // Set database pool in locals for billing routes
   app.locals.dbPool = pool;
@@ -253,7 +255,7 @@ export const createApp = (dependencies?: Partial<AppDependencies>) => {
   );
 
   // Mount all routes including billing
-  app.use('/api', routes);
+  app.use('/api', createApiRouter({ restRateLimit }));
 
   app.get('/api/usage', requireAuth, async (req, res: express.Response<unknown, AuthenticatedLocals>, next) => {
   const user = res.locals.authenticatedUser;

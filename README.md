@@ -17,6 +17,7 @@ API gateway, usage metering, and billing services for the Callora API marketplac
   - `POST /api/apis` for authenticated developers to register an API with priced endpoints
 - Usage route: `GET /api/usage`
 - JSON body parsing plus gateway API key authentication for upstream proxy routes
+- Per-user global REST rate limiting for authenticated `/api/billing`, `/api/usage`, `/api/developers`, `/api/vault`, and `/api/keys` traffic, with IP fallback for unauthenticated requests
 - In-memory `VaultRepository` with:
   - `create(userId, contractId, network)`
   - `findByUserId(userId, network)`
@@ -164,6 +165,8 @@ The app validates all environment variables at startup using [Zod](https://zod.d
 | `METRICS_API_KEY` | **Yes** | — | Key for `/api/metrics` in production |
 | `UPSTREAM_URL` | No | `http://localhost:4000` | Gateway upstream URL |
 | `PROXY_TIMEOUT_MS` | No | `30000` | Proxy request timeout (ms) |
+| `REST_RATE_LIMIT_WINDOW_MS` | No | `60000` | Window length for REST API rate limiting (ms) |
+| `REST_RATE_LIMIT_MAX_REQUESTS` | No | `100` | Max REST API requests allowed per user/IP per window |
 | `CORS_ALLOWED_ORIGINS` | No | `http://localhost:5173` | Comma-separated allowed origins |
 | `SOROBAN_RPC_ENABLED` | No | `false` | Enable Soroban RPC health check |
 | `SOROBAN_RPC_URL` | If `SOROBAN_RPC_ENABLED=true` | — | Soroban RPC endpoint URL |

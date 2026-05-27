@@ -21,12 +21,22 @@ export interface BillingUsageEvent {
   createdAt: Date;
 }
 
+export interface RevenueLedgerUsageEvent {
+  usageEventId: string;
+  apiId: string;
+  developerId: string;
+  amount: bigint;
+  createdAt: Date;
+}
+
 export interface UsageEventsPgRepository {
   create(event: CreateUsageEventInput): Promise<BillingUsageEvent>;
   findByUserId(userId: string, from?: Date, to?: Date, limit?: number, offset?: number): Promise<BillingUsageEvent[]>;
   findByApiId(apiId: string, from?: Date, to?: Date, limit?: number, offset?: number): Promise<BillingUsageEvent[]>;
   getTotalSpentByUser(userId: string, from?: Date, to?: Date): Promise<bigint>;
   getTotalRevenueByApi(apiId: string, from?: Date, to?: Date): Promise<bigint>;
+  findUnindexedRevenueLedgerEvents(cursor?: string, limit?: number): Promise<RevenueLedgerUsageEvent[]>;
+  indexRevenueLedgerEvent(event: RevenueLedgerUsageEvent): Promise<boolean>;
 }
 
 export interface UsageEventsRepositoryQueryable {
@@ -47,6 +57,14 @@ interface UsageEventRow {
 
 interface TotalRow {
   total: string | number | bigint | null;
+}
+
+interface RevenueLedgerUsageEventRow {
+  usage_event_id: string | number | bigint;
+  api_id: string;
+  developer_id: string;
+  amount_usdc: string | number | bigint;
+  created_at: Date | string;
 }
 
 const assertNonEmpty = (value: string, fieldName: string): string => {
@@ -92,6 +110,19 @@ const normalizeLimit = (limit?: number): number | undefined => {
   return limit;
 };
 
+const normalizeCursor = (cursor?: string): string | undefined => {
+  if (cursor === undefined) {
+    return undefined;
+  }
+
+  const trimmed = cursor.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error('cursor must be a non-negative integer string.');
+  }
+
+  return trimmed;
+};
+
 const toBigInt = (value: string | number | bigint | null, fieldName: string): bigint => {
   if (value === null) {
     return 0n;
@@ -126,6 +157,16 @@ const mapUsageEventRow = (row: UsageEventRow): BillingUsageEvent => ({
   amount: toBigInt(row.amount_usdc, 'amount_usdc'),
   requestId: row.request_id,
   stellarTxHash: row.stellar_tx_hash,
+  createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
+});
+
+const mapRevenueLedgerUsageEventRow = (
+  row: RevenueLedgerUsageEventRow,
+): RevenueLedgerUsageEvent => ({
+  usageEventId: String(row.usage_event_id),
+  apiId: row.api_id,
+  developerId: row.developer_id,
+  amount: toBigInt(row.amount_usdc, 'amount_usdc'),
   createdAt: row.created_at instanceof Date ? row.created_at : new Date(row.created_at),
 });
 
@@ -225,6 +266,71 @@ export class PgUsageEventsRepository implements UsageEventsPgRepository {
 
   async getTotalRevenueByApi(apiId: string, from?: Date, to?: Date): Promise<bigint> {
     return this.sumByColumn('api_id', assertNonEmpty(apiId, 'apiId'), from, to);
+  }
+
+  async findUnindexedRevenueLedgerEvents(
+    cursor?: string,
+    limit = 100,
+  ): Promise<RevenueLedgerUsageEvent[]> {
+    const normalizedCursor = normalizeCursor(cursor) ?? '0';
+    const normalizedLimit = normalizeLimit(limit);
+    if (normalizedLimit === 0) {
+      return [];
+    }
+
+    const result = await this.db.query<RevenueLedgerUsageEventRow>(
+      `
+        SELECT
+          ue.id AS usage_event_id,
+          ue.api_id,
+          a.developer_id,
+          ue.amount_usdc,
+          ue.created_at
+        FROM usage_events ue
+        INNER JOIN apis a
+          ON a.id = ue.api_id
+        LEFT JOIN revenue_ledger rl
+          ON rl.usage_event_id = ue.id
+        WHERE ue.id > $1
+          AND rl.usage_event_id IS NULL
+        ORDER BY ue.id ASC
+        LIMIT $2
+      `,
+      [normalizedCursor, normalizedLimit],
+    );
+
+    return result.rows.map(mapRevenueLedgerUsageEventRow);
+  }
+
+  async indexRevenueLedgerEvent(event: RevenueLedgerUsageEvent): Promise<boolean> {
+    const result = await this.db.query<{ inserted: number }>(
+      `
+        INSERT INTO revenue_ledger (
+          api_id,
+          developer_id,
+          amount_usdc,
+          usage_event_id,
+          created_at
+        )
+        SELECT $1, $2, $3::numeric, $4::bigint, $5::timestamp
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM revenue_ledger
+          WHERE usage_event_id = $4::bigint
+        )
+        ON CONFLICT (usage_event_id) DO NOTHING
+        RETURNING 1 AS inserted
+      `,
+      [
+        assertNonEmpty(event.apiId, 'apiId'),
+        assertNonEmpty(event.developerId, 'developerId'),
+        assertAmount(event.amount).toString(),
+        normalizeCursor(event.usageEventId) ?? '0',
+        event.createdAt,
+      ],
+    );
+
+    return Boolean(result.rows[0]);
   }
 
   private async findByColumn(

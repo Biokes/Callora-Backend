@@ -1,12 +1,20 @@
-export interface DbHealthStatus {
-  status: 'ok' | 'error';
-  error?: string;
-}
+export type HealthComponentStatus = 'ok' | 'degraded' | 'down';
 
 export interface HealthResponse {
-  status: 'ok' | 'degraded';
-  service: string;
-  db?: DbHealthStatus;
+  status: HealthComponentStatus;
+  service?: string;
+  version?: string;
+  timestamp?: string;
+  checks?: {
+    api: HealthComponentStatus;
+    database: HealthComponentStatus;
+    soroban_rpc?: HealthComponentStatus;
+    horizon?: HealthComponentStatus;
+  };
+  db?: {
+    status: 'ok' | 'error';
+    error?: string;
+  };
 }
 
 export interface ApiSummary {
@@ -47,3 +55,10 @@ export interface UsageResponse {
   calls: number;
   period: string;
 }
+
+export type {
+  CalloraEventListener,
+  CalloraEventName,
+  CalloraEventPayloadMap,
+  CalloraEventUnsubscribe,
+} from '../events/event.emitter.js';

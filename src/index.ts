@@ -2,7 +2,7 @@ import './config/env.js'
 import express from 'express';
 import helmet from 'helmet';
 import { initializeDb, closeDb } from './db/index.js';
-import { closePgPool } from './db.js';
+import { closePgPool, pool } from './db.js';
 import { closeDbPool } from './config/health.js';
 import { disconnectPrisma } from './lib/prisma.js';
 import { errorHandler } from './middleware/errorHandler.js';

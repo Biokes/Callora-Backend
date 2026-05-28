@@ -1,4 +1,4 @@
-import { Router, type RequestHandler } from 'express';
+import { Router, type RequestHandler, type Router as ExpressRouter } from 'express';
 import healthRouter from './health.js';
 import { createUsageRouter, type UsageRouterDeps } from './usage.js';
 import billingRouter from './billing.js';

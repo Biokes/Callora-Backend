@@ -133,6 +133,13 @@ export const config = {
     maxRequests: env.REST_RATE_LIMIT_MAX_REQUESTS,
   },
 
+  rateLimiter: {
+    maxRequests: env.RATE_LIMIT_MAX_REQUESTS,
+    windowMs: env.RATE_LIMIT_WINDOW_MS,
+    store: env.RATE_LIMIT_STORE,
+    postgresTable: env.RATE_LIMIT_PG_TABLE,
+  },
+
   sorobanRpc:
     env.SOROBAN_RPC_ENABLED && env.SOROBAN_RPC_URL
       ? {

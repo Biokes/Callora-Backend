@@ -1,205 +1,397 @@
-/**
- * Stellar transaction builder with resilience patterns.
- * 
- * Wraps Horizon network calls with:
- * - Exponential backoff retry logic
- * - Circuit breaker for fast-fail during outages
- * 
- * Environment Configuration:
- * - HORIZON_URL: Stellar Horizon endpoint (default: testnet)
- * - STELLAR_BASE_FEE: Transaction base fee in stroops (default: 100)
- * - STELLAR_TRANSACTION_TIMEOUT: Transaction timeout in seconds (default: 30)
- * - CIRCUIT_BREAKER_THRESHOLD: Failures before opening circuit (default: 5)
- * - CIRCUIT_BREAKER_COOLDOWN_MS: Cooldown period in ms (default: 30000)
- * - RETRY_MAX_ATTEMPTS: Max retry attempts (default: 3)
- * - RETRY_BASE_DELAY_MS: Initial retry delay in ms (default: 1000)
- */
+import {
+  Horizon,
+  TransactionBuilder,
+  Operation,
+  Address,
+  Memo,
+  nativeToScVal,
+} from '@stellar/stellar-sdk';
+import { config } from '../config/index.js';
+import { withRetry } from '../lib/retry.js';
 
-import { Server, Networks, TransactionBuilder, Operation, Asset, Keypair } from 'stellar-sdk';
-import { CircuitBreaker } from '../lib/circuitBreaker.js';
-import { withRetry, RetryConfig } from '../lib/retry.js';
+export type StellarNetwork = 'testnet' | 'mainnet';
 
-/**
- * Configuration for the transaction builder service.
- */
-export interface TransactionBuilderConfig {
-  horizonUrl?: string;
-  networkPassphrase?: string;
-  baseFee?: string;
-  transactionTimeout?: number;
-  circuitBreakerThreshold?: number;
-  circuitBreakerCooldownMs?: number;
-  retryMaxAttempts?: number;
+export interface BuildDepositParams {
+  userPublicKey: string;
+  vaultContractId: string;
+  amountUsdc: string;
+  network?: StellarNetwork;
+  sourceAccount?: string;
+  memoText?: string | null;
+}
+
+export interface SorobanInvokeArg {
+  type: 'address' | 'i128' | 'string';
+  value: string;
+}
+
+export interface TransactionOperation {
+  type: 'invoke_contract';
+  contractId: string;
+  function: string;
+  args: SorobanInvokeArg[];
+}
+
+export interface TransactionMemo {
+  type: 'text';
+  value: string;
+}
+
+export interface UnsignedTransaction {
+  xdr: string;
+  network: string;
+  operation: TransactionOperation;
+  fee: string;
+  timeout: number;
+  memo?: TransactionMemo;
+}
+
+export class InvalidContractIdError extends Error {
+  constructor(contractId: string) {
+    super(`Invalid contract ID format: ${contractId}`);
+    this.name = 'InvalidContractIdError';
+  }
+}
+
+export class InvalidStellarAddressError extends Error {
+  constructor(field: string, value: string) {
+    super(`Invalid ${field}: ${value}`);
+    this.name = 'InvalidStellarAddressError';
+  }
+}
+
+export class InvalidAmountError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidAmountError';
+  }
+}
+
+export class InvalidMemoError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'InvalidMemoError';
+  }
+}
+
+export class SourceAccountNotFoundError extends Error {
+  constructor(accountId: string) {
+    super(`Source account was not found on the configured Stellar network: ${accountId}`);
+    this.name = 'SourceAccountNotFoundError';
+  }
+}
+
+export class NetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NetworkError';
+  }
+}
+
+export class TransactionBuildError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TransactionBuildError';
+  }
+}
+
+interface HorizonAccountLoader {
+  loadAccount(accountId: string): Promise<unknown>;
+}
+
+interface NormalizedMemo {
+  sdkMemo: ReturnType<typeof Memo.text>;
+  value: string;
+}
+
+export interface TransactionBuilderServiceOptions {
+  createServer?: (horizonUrl: string) => HorizonAccountLoader;
+  baseFee?: string | number;
+  timeoutSeconds?: number;
+  /** Maximum number of retries for transient Horizon errors. Default: 3. */
+  maxRetries?: number;
+  /** Base delay in ms for exponential backoff. Default: 500. */
   retryBaseDelayMs?: number;
 }
 
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_RETRY_BASE_DELAY_MS = 500;
+
 /**
- * Parameters for building a vault deposit transaction.
+ * Returns true for errors that represent a transient Horizon failure worth retrying.
+ * 404 / account-not-found is a permanent state — retrying won't help.
  */
-export interface VaultDepositParams {
-  sourcePublicKey: string;
-  vaultPublicKey: string;
-  amount: string;
-  asset?: Asset;
+function isHorizonTransientError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === 'AbortError') return false;
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  return !msg.includes('404') && !msg.includes('not found') && !msg.includes('resource missing');
 }
 
-/**
- * Default configuration values from environment or fallback.
- */
-function getDefaultConfig(): Required<TransactionBuilderConfig> {
-  return {
-    horizonUrl: process.env.HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
-    networkPassphrase: process.env.STELLAR_NETWORK ?? Networks.TESTNET,
-    baseFee: process.env.STELLAR_BASE_FEE ?? '100',
-    transactionTimeout: parseInt(process.env.STELLAR_TRANSACTION_TIMEOUT ?? '30', 10),
-    circuitBreakerThreshold: parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD ?? '5', 10),
-    circuitBreakerCooldownMs: parseInt(process.env.CIRCUIT_BREAKER_COOLDOWN_MS ?? '30000', 10),
-    retryMaxAttempts: parseInt(process.env.RETRY_MAX_ATTEMPTS ?? '3', 10),
-    retryBaseDelayMs: parseInt(process.env.RETRY_BASE_DELAY_MS ?? '1000', 10),
-  };
-}
+export class TransactionBuilderService {
+  private static readonly DEFAULT_TRANSACTION_TIMEOUT = 300;
+  private static readonly USDC_STROOPS_MULTIPLIER = 10_000_000n;
+  private static readonly MAX_USDC_STROOPS = 1_000_000_000n * 10_000_000n;
 
-/**
- * Transaction builder service with resilience patterns.
- */
-export class StellarTransactionBuilder {
-  private readonly server: Server;
-  private readonly config: Required<TransactionBuilderConfig>;
-  private readonly circuitBreaker: CircuitBreaker;
-  private readonly retryConfig: RetryConfig;
+  constructor(private readonly options: TransactionBuilderServiceOptions = {}) {}
 
-  constructor(config: TransactionBuilderConfig = {}) {
-    this.config = { ...getDefaultConfig(), ...config };
-    this.server = new Server(this.config.horizonUrl);
-    
-    this.circuitBreaker = new CircuitBreaker({
-      failureThreshold: this.config.circuitBreakerThreshold,
-      cooldownMs: this.config.circuitBreakerCooldownMs,
-    });
+  async buildDepositTransaction(
+    params: BuildDepositParams
+  ): Promise<UnsignedTransaction> {
+    const selectedNetwork = params.network ?? config.stellar.network;
 
-    this.retryConfig = {
-      maxAttempts: this.config.retryMaxAttempts,
-      baseDelayMs: this.config.retryBaseDelayMs,
+    if (selectedNetwork !== 'testnet' && selectedNetwork !== 'mainnet') {
+      throw new NetworkError(`Unsupported Stellar network: ${String(selectedNetwork)}`);
+    }
+
+    if (selectedNetwork !== config.stellar.network) {
+      throw new NetworkError(
+        `Configured network is '${config.stellar.network}' but request used '${selectedNetwork}'. Cross-network mixing is not allowed.`
+      );
+    }
+
+    const expectedVaultContractId = config.stellar.networks[selectedNetwork].vaultContractId;
+    if (expectedVaultContractId && expectedVaultContractId !== params.vaultContractId) {
+      throw new NetworkError(
+        `Vault contract ID does not match configured ${selectedNetwork} contract ID.`
+      );
+    }
+
+    const { networkPassphrase, horizonUrl } = this.getNetworkConfig(selectedNetwork);
+    const fee = this.resolveFee();
+    const timeout = this.resolveTimeout();
+    const server = this.createServer(horizonUrl);
+
+    const sourceKey = params.sourceAccount ?? params.userPublicKey;
+    const amountStroops = this.convertUsdcToStroops(params.amountUsdc);
+    const contractAddress = this.parseContractAddress(params.vaultContractId);
+    const userAddress = this.parseStellarAddress(params.userPublicKey, 'user public key');
+    this.parseStellarAddress(sourceKey, 'source account');
+    const memo = this.createMemo(params.memoText);
+
+    let sourceAccount: unknown;
+
+    try {
+      sourceAccount = await withRetry(
+        () => server.loadAccount(sourceKey),
+        {
+          maxAttempts: (this.options.maxRetries ?? DEFAULT_MAX_RETRIES) + 1,
+          baseDelayMs: this.options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
+          shouldRetry: isHorizonTransientError,
+        }
+      );
+    } catch (error) {
+      throw this.mapLoadAccountError(sourceKey, error);
+    }
+
+    let operation;
+    try {
+      operation = Operation.invokeContractFunction({
+        contract: contractAddress.toString(),
+        function: 'deposit',
+        args: [
+          nativeToScVal(userAddress, { type: 'address' }),
+          nativeToScVal(amountStroops, { type: 'i128' }),
+        ],
+      });
+    } catch (error) {
+      throw new TransactionBuildError(
+        `Failed to assemble Stellar contract invocation: ${this.getErrorMessage(error)}`
+      );
+    }
+
+    try {
+      let builder = new TransactionBuilder(
+        sourceAccount as ConstructorParameters<typeof TransactionBuilder>[0],
+        {
+          fee,
+          networkPassphrase,
+        }
+      ).addOperation(operation);
+
+      if (memo) {
+        builder = builder.addMemo(memo.sdkMemo);
+      }
+
+      const transaction = builder.setTimeout(timeout).build();
+
+      if (transaction.signatures.length !== 0) {
+        throw new TransactionBuildError('Transaction should not have signatures');
+      }
+
+      return {
+        xdr: transaction.toXDR(),
+        network: selectedNetwork,
+        operation: {
+          type: 'invoke_contract',
+          contractId: params.vaultContractId,
+          function: 'deposit',
+          args: [
+            { type: 'address', value: params.userPublicKey },
+            { type: 'i128', value: amountStroops.toString() },
+          ],
+        },
+        fee,
+        timeout,
+        ...(memo
+          ? {
+              memo: {
+                type: 'text' as const,
+                value: memo.value,
+              },
+            }
+          : {}),
+      };
+    } catch (error) {
+      if (error instanceof TransactionBuildError) {
+        throw error;
+      }
+
+      throw new TransactionBuildError(
+        `Failed to build Stellar transaction: ${this.getErrorMessage(error)}`
+      );
+    }
+  }
+
+  private getNetworkConfig(network: StellarNetwork): {
+    networkPassphrase: string;
+    horizonUrl: string;
+  } {
+    const networkConfig = config.stellar.networks[network];
+    return {
+      networkPassphrase: networkConfig.networkPassphrase,
+      horizonUrl: networkConfig.horizonUrl,
     };
   }
 
-  /**
-   * Load account from Horizon with retry and circuit breaker protection.
-   * 
-   * @param publicKey - Stellar public key
-   * @returns Account object from Horizon
-   */
-  async loadAccount(publicKey: string): Promise<any> {
-    return this.circuitBreaker.execute(() =>
-      withRetry(
-        async () => {
-          return await this.server.loadAccount(publicKey);
-        },
-        this.retryConfig
-      )
+  private createServer(horizonUrl: string): HorizonAccountLoader {
+    return this.options.createServer?.(horizonUrl) ?? new Horizon.Server(horizonUrl);
+  }
+
+  private resolveFee(): string {
+    const configuredFee = this.options.baseFee ?? config.stellar.baseFee;
+    const parsedFee =
+      typeof configuredFee === 'number'
+        ? configuredFee
+        : /^\d+$/.test(configuredFee)
+          ? Number.parseInt(configuredFee, 10)
+          : Number.NaN;
+
+    if (!Number.isSafeInteger(parsedFee) || parsedFee <= 0) {
+      throw new TransactionBuildError('Invalid Stellar base fee configuration');
+    }
+
+    return String(parsedFee);
+  }
+
+  private resolveTimeout(): number {
+    const timeout =
+      this.options.timeoutSeconds ??
+      config.stellar.transactionTimeout ??
+      TransactionBuilderService.DEFAULT_TRANSACTION_TIMEOUT;
+
+    if (!Number.isSafeInteger(timeout) || timeout <= 0) {
+      throw new TransactionBuildError('Invalid Stellar transaction timeout configuration');
+    }
+
+    return timeout;
+  }
+
+  private parseContractAddress(contractId: string): Address {
+    try {
+      return new Address(contractId);
+    } catch {
+      throw new InvalidContractIdError(contractId);
+    }
+  }
+
+  private parseStellarAddress(value: string, field: string): Address {
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new InvalidStellarAddressError(field, String(value));
+    }
+
+    try {
+      return new Address(value);
+    } catch {
+      throw new InvalidStellarAddressError(field, value);
+    }
+  }
+
+  private createMemo(memoText?: string | null): NormalizedMemo | undefined {
+    if (memoText === undefined || memoText === null) {
+      return undefined;
+    }
+
+    if (typeof memoText !== 'string') {
+      throw new InvalidMemoError('Memo must be a string when provided');
+    }
+
+    const trimmedMemo = memoText.trim();
+    if (trimmedMemo.length === 0) {
+      return undefined;
+    }
+
+    if (Buffer.byteLength(trimmedMemo, 'utf8') > 28) {
+      throw new InvalidMemoError('Memo must be 28 bytes or fewer');
+    }
+
+    return {
+      sdkMemo: Memo.text(trimmedMemo),
+      value: trimmedMemo,
+    };
+  }
+
+  private convertUsdcToStroops(amountUsdc: string): bigint {
+    if (typeof amountUsdc !== 'string') {
+      throw new InvalidAmountError('Amount must be a string');
+    }
+
+    if (!/^\d+\.\d{7}$/.test(amountUsdc)) {
+      throw new InvalidAmountError(
+        'Amount must have exactly 7 decimal places (e.g., "100.0000000")'
+      );
+    }
+
+    const [wholePart, fractionalPart] = amountUsdc.split('.');
+    const amountStroops =
+      BigInt(wholePart) * TransactionBuilderService.USDC_STROOPS_MULTIPLIER +
+      BigInt(fractionalPart);
+
+    if (amountStroops <= 0n) {
+      throw new InvalidAmountError('Amount must be greater than zero');
+    }
+
+    if (amountStroops > TransactionBuilderService.MAX_USDC_STROOPS) {
+      throw new InvalidAmountError('Amount exceeds maximum limit of 1,000,000,000 USDC');
+    }
+
+    return amountStroops;
+  }
+
+  private mapLoadAccountError(accountId: string, error: unknown): Error {
+    const message = this.getErrorMessage(error).toLowerCase();
+
+    if (
+      message.includes('404') ||
+      message.includes('not found') ||
+      message.includes('resource missing')
+    ) {
+      return new SourceAccountNotFoundError(accountId);
+    }
+
+    return new NetworkError(
+      `Failed to load source account from Stellar network: ${this.getErrorMessage(error)}`
     );
   }
 
-  /**
-   * Fetch current base fee from Horizon with retry and circuit breaker protection.
-   * Falls back to configured base fee on failure.
-   * 
-   * @returns Base fee in stroops
-   */
-  async fetchBaseFee(): Promise<string> {
-    try {
-      return await this.circuitBreaker.execute(() =>
-        withRetry(
-          async () => {
-            const feeStats = await this.server.feeStats();
-            return feeStats.max_fee.mode;
-          },
-          this.retryConfig
-        )
-      );
-    } catch (error) {
-      console.warn(
-        `Failed to fetch base fee from Horizon: ${error instanceof Error ? error.message : String(error)}. ` +
-        `Using configured base fee: ${this.config.baseFee}`
-      );
-      return this.config.baseFee;
-    }
-  }
-
-  /**
-   * Build a vault deposit transaction.
-   * 
-   * @param params - Deposit parameters
-   * @returns Unsigned transaction XDR
-   */
-  async buildVaultDepositTransaction(params: VaultDepositParams): Promise<string> {
-    const { sourcePublicKey, vaultPublicKey, amount, asset = Asset.native() } = params;
-
-    // Validate public keys
-    try {
-      Keypair.fromPublicKey(sourcePublicKey);
-      Keypair.fromPublicKey(vaultPublicKey);
-    } catch (error) {
-      throw new Error(`Invalid public key: ${error instanceof Error ? error.message : String(error)}`);
+  private getErrorMessage(error: unknown): string {
+    if (error instanceof Error && error.message.trim()) {
+      return error.message;
     }
 
-    // Load source account with resilience
-    const sourceAccount = await this.loadAccount(sourcePublicKey);
+    if (typeof error === 'string' && error.trim()) {
+      return error;
+    }
 
-    // Fetch base fee with resilience (falls back to config on failure)
-    const baseFee = await this.fetchBaseFee();
-
-    // Build transaction
-    const transaction = new TransactionBuilder(sourceAccount, {
-      fee: baseFee,
-      networkPassphrase: this.config.networkPassphrase,
-    })
-      .addOperation(
-        Operation.payment({
-          destination: vaultPublicKey,
-          asset: asset,
-          amount: amount,
-        })
-      )
-      .setTimeout(this.config.transactionTimeout)
-      .build();
-
-    return transaction.toXDR();
+    return 'Unknown error';
   }
-
-  /**
-   * Get circuit breaker metrics for monitoring.
-   */
-  getMetrics() {
-    return this.circuitBreaker.getMetrics();
-  }
-
-  /**
-   * Get current configuration.
-   */
-  getConfig(): Required<TransactionBuilderConfig> {
-    return { ...this.config };
-  }
-}
-
-/**
- * Singleton instance for application-wide use.
- */
-let instance: StellarTransactionBuilder | null = null;
-
-/**
- * Get or create the singleton transaction builder instance.
- */
-export function getTransactionBuilder(config?: TransactionBuilderConfig): StellarTransactionBuilder {
-  if (!instance) {
-    instance = new StellarTransactionBuilder(config);
-  }
-  return instance;
-}
-
-/**
- * Reset the singleton instance (primarily for testing).
- */
-export function resetTransactionBuilder(): void {
-  instance = null;
 }

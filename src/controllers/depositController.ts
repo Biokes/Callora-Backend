@@ -1,143 +1,225 @@
-/**
- * Deposit controller for vault deposit operations.
- * 
- * Handles HTTP requests for building vault deposit transactions.
- * Maps circuit breaker and retry failures to appropriate HTTP status codes.
- */
+import type { Request, Response } from 'express';
+import type { AuthenticatedLocals } from '../middleware/requireAuth.js';
+import { AmountValidator } from '../validators/amountValidator.js';
+import {
+  TransactionBuilderService,
+  type StellarNetwork,
+  InvalidContractIdError,
+  InvalidAmountError,
+  InvalidMemoError,
+  InvalidStellarAddressError,
+  NetworkError,
+  SourceAccountNotFoundError,
+  TransactionBuildError,
+} from '../services/transactionBuilder.js';
+import type { VaultRepository } from '../repositories/vaultRepository.js';
+import { config } from '../config/index.js';
 
-import { Request, Response, NextFunction } from 'express';
-import { getTransactionBuilder } from '../services/transactionBuilder.js';
-import { CircuitBreakerOpenError, RetryExhaustedError, BadGatewayError, BadRequestError } from '../lib/errors.js';
+export interface DepositPrepareRequest {
+  amount_usdc: string;
+  network?: string;
+  source_account?: string;
+}
 
-/**
- * Request body schema for vault deposit.
- */
-interface DepositRequestBody {
-  sourcePublicKey: string;
-  vaultPublicKey: string;
+export interface DepositPrepareResponse {
+  xdr: string;
+  network: string;
+  contractId: string;
   amount: string;
+  operation: {
+    type: 'invoke_contract';
+    function: 'deposit';
+    args: Array<{
+      type: string;
+      value: string;
+    }>;
+  };
+  metadata: {
+    fee: string;
+    timeout: number;
+  };
 }
 
-/**
- * Validate deposit request body.
- */
-function validateDepositRequest(body: any): body is DepositRequestBody {
-  if (!body || typeof body !== 'object') {
-    return false;
+export class VaultNotFoundError extends Error {
+  constructor(userId: string, network: string) {
+    super(`Vault not found for user on network '${network}'. Please create a vault first.`);
+    this.name = 'VaultNotFoundError';
   }
-
-  const { sourcePublicKey, vaultPublicKey, amount } = body;
-
-  if (typeof sourcePublicKey !== 'string' || !sourcePublicKey.trim()) {
-    return false;
-  }
-
-  if (typeof vaultPublicKey !== 'string' || !vaultPublicKey.trim()) {
-    return false;
-  }
-
-  if (typeof amount !== 'string' || !amount.trim()) {
-    return false;
-  }
-
-  // Validate amount is a positive number
-  const amountNum = parseFloat(amount);
-  if (isNaN(amountNum) || amountNum <= 0) {
-    return false;
-  }
-
-  return true;
 }
 
-/**
- * POST /api/deposits/build
- * 
- * Build a vault deposit transaction.
- * 
- * Request body:
- * - sourcePublicKey: Source account public key
- * - vaultPublicKey: Vault account public key
- * - amount: Amount to deposit (in XLM)
- * 
- * Response:
- * - transactionXdr: Unsigned transaction XDR
- * 
- * Error responses:
- * - 400: Invalid request body
- * - 502: Circuit breaker open or retry exhausted (upstream failure)
- * - 500: Internal server error
- */
-export async function buildDepositTransaction(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    // Validate request body
-    if (!validateDepositRequest(req.body)) {
-      throw new BadRequestError(
-        'Invalid request body. Required fields: sourcePublicKey, vaultPublicKey, amount (positive number)'
-      );
+export class DepositController {
+  constructor(
+    private readonly vaultRepository: VaultRepository,
+    private readonly transactionBuilder: TransactionBuilderService
+  ) {}
+
+  async prepareDeposit(
+    req: Request,
+    res: Response<unknown, AuthenticatedLocals>
+  ): Promise<void> {
+    try {
+      // Step 1: Extract authenticated user
+      const user = res.locals.authenticatedUser;
+      if (!user) {
+        res.status(401).json({
+          error: 'Authentication required',
+          code: 'UNAUTHORIZED',
+        });
+        return;
+      }
+
+      // Step 2: Parse and validate request body
+      const requestBody = req.body as DepositPrepareRequest;
+
+      if (!requestBody.amount_usdc) {
+        res.status(400).json({
+          error: 'amount_usdc is required',
+          code: 'MISSING_AMOUNT',
+        });
+        return;
+      }
+
+      if (typeof requestBody.amount_usdc !== 'string') {
+        res.status(400).json({
+          error: 'amount_usdc must be a string',
+          code: 'INVALID_AMOUNT_TYPE',
+        });
+        return;
+      }
+
+      // Step 3: Validate amount format
+      const validation = AmountValidator.validateUsdcAmount(requestBody.amount_usdc);
+      if (!validation.valid) {
+        res.status(400).json({
+          error: validation.error,
+          code: 'INVALID_AMOUNT_FORMAT',
+          provided: requestBody.amount_usdc,
+        });
+        return;
+      }
+
+      // Step 4: Validate and default network
+      const network = (requestBody.network ?? config.stellar.network) as StellarNetwork;
+      if (network !== 'testnet' && network !== 'mainnet') {
+        res.status(400).json({
+          error: 'network must be either "testnet" or "mainnet"',
+          code: 'INVALID_NETWORK',
+          provided: requestBody.network,
+        });
+        return;
+      }
+
+      if (network !== config.stellar.network) {
+        res.status(400).json({
+          error: `Configured network is '${config.stellar.network}'. Cross-network requests are not allowed.`,
+          code: 'NETWORK_MISMATCH',
+          provided: network,
+          configured: config.stellar.network,
+        });
+        return;
+      }
+
+      // Step 5: Validate source account if provided
+      if (requestBody.source_account) {
+        if (!this.isValidStellarPublicKey(requestBody.source_account)) {
+          res.status(400).json({
+            error: 'source_account must be a valid Stellar public key (G...)',
+            code: 'INVALID_SOURCE_ACCOUNT',
+            provided: requestBody.source_account,
+          });
+          return;
+        }
+      }
+
+      // Step 6: Retrieve user's vault
+      const vault = await this.vaultRepository.findByUserId(user.id, network);
+      if (!vault) {
+        res.status(404).json({
+          error: `Vault not found for user on network '${network}'. Please create a vault first.`,
+          code: 'VAULT_NOT_FOUND',
+        });
+        return;
+      }
+
+      // Step 7: Build unsigned transaction
+      const unsignedTx = await this.transactionBuilder.buildDepositTransaction({
+        userPublicKey: user.id, // Assuming user.id is the Stellar public key
+        vaultContractId: vault.contractId,
+        amountUsdc: validation.normalizedAmount!,
+        network,
+        sourceAccount: requestBody.source_account,
+      });
+
+      // Step 8: Construct and return response
+      const response: DepositPrepareResponse = {
+        xdr: unsignedTx.xdr,
+        network: unsignedTx.network,
+        contractId: vault.contractId,
+        amount: validation.normalizedAmount!,
+        operation: {
+          type: unsignedTx.operation.type,
+          function: unsignedTx.operation.function as 'deposit',
+          args: unsignedTx.operation.args,
+        },
+        metadata: {
+          fee: unsignedTx.fee,
+          timeout: unsignedTx.timeout,
+        },
+      };
+
+      res.status(200).json(response);
+    } catch (error) {
+      this.handleError(error, res);
     }
+  }
 
-    const { sourcePublicKey, vaultPublicKey, amount } = req.body;
+  private isValidStellarPublicKey(key: string): boolean {
+    // Stellar public keys start with 'G' and are 56 characters long
+    return /^G[A-Z0-9]{55}$/.test(key);
+  }
 
-    // Build transaction with resilience patterns
-    const transactionBuilder = getTransactionBuilder();
-    const transactionXdr = await transactionBuilder.buildVaultDepositTransaction({
-      sourcePublicKey,
-      vaultPublicKey,
-      amount,
-    });
-
-    res.status(200).json({
-      success: true,
-      transactionXdr,
-    });
-  } catch (error) {
-    // Map specific errors to appropriate HTTP status codes
-    if (error instanceof CircuitBreakerOpenError) {
-      const badGatewayError = new BadGatewayError(
-        'Stellar Horizon service is currently unavailable. Circuit breaker is open. Please try again later.'
-      );
-      next(badGatewayError);
-    } else if (error instanceof RetryExhaustedError) {
-      const badGatewayError = new BadGatewayError(
-        'Failed to connect to Stellar Horizon after multiple retries. Please try again later.'
-      );
-      next(badGatewayError);
-    } else if (error instanceof BadRequestError) {
-      next(error);
+  private handleError(error: unknown, res: Response): void {
+    if (error instanceof VaultNotFoundError) {
+      res.status(404).json({
+        error: error.message,
+        code: 'VAULT_NOT_FOUND',
+      });
+    } else if (
+      error instanceof InvalidAmountError ||
+      error instanceof InvalidMemoError ||
+      error instanceof InvalidStellarAddressError
+    ) {
+      res.status(400).json({
+        error: error.message,
+        code: 'INVALID_TRANSACTION_INPUT',
+      });
+    } else if (error instanceof SourceAccountNotFoundError) {
+      res.status(400).json({
+        error: error.message,
+        code: 'SOURCE_ACCOUNT_NOT_FOUND',
+      });
+    } else if (error instanceof InvalidContractIdError) {
+      res.status(500).json({
+        error: 'Invalid vault contract configuration. Please contact support.',
+        code: 'INVALID_CONTRACT_ID',
+      });
+    } else if (error instanceof NetworkError) {
+      res.status(503).json({
+        error: 'Unable to connect to Stellar network. Please try again later.',
+        code: 'NETWORK_UNAVAILABLE',
+        network: error.message,
+      });
+    } else if (error instanceof TransactionBuildError) {
+      res.status(502).json({
+        error: 'Failed to build Stellar transaction. Please try again later.',
+        code: 'TRANSACTION_BUILD_FAILED',
+      });
     } else {
-      // Pass other errors to the error handler
-      next(error);
+      // Generic error - don't reveal sensitive details
+      res.status(500).json({
+        error: 'Failed to prepare deposit transaction',
+        code: 'INTERNAL_ERROR',
+      });
     }
-  }
-}
-
-/**
- * GET /api/deposits/health
- * 
- * Get circuit breaker health metrics.
- * 
- * Response:
- * - state: Circuit breaker state (CLOSED, OPEN, HALF_OPEN)
- * - metrics: Detailed circuit breaker metrics
- */
-export async function getDepositHealth(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): Promise<void> {
-  try {
-    const transactionBuilder = getTransactionBuilder();
-    const metrics = transactionBuilder.getMetrics();
-
-    res.status(200).json({
-      success: true,
-      circuitBreaker: metrics,
-    });
-  } catch (error) {
-    next(error);
   }
 }

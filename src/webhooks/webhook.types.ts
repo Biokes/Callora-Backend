@@ -41,3 +41,20 @@ export interface LowBalanceAlertData {
     thresholdBalance: string;
     asset: string;
 }
+
+// Delivery status for webhook attempts
+export type WebhookDeliveryStatus = 'pending' | 'delivered' | 'dead_letter';
+
+// Dead-letter entry for permanently failed webhook deliveries
+export interface DeadLetterEntry {
+    id: string;
+    webhookConfigId: string; // developerId from WebhookConfig
+    url: string;
+    event: WebhookEventType;
+    payload: WebhookPayload;
+    status: WebhookDeliveryStatus;
+    attempts: number;
+    lastError: string;
+    lastAttemptAt: Date;
+    deadLetterAt: Date;
+}

@@ -1,17 +1,32 @@
-
 import crypto from 'crypto';
-import { WebhookConfig, WebhookPayload } from './webhook.types.js';
+import { WebhookConfig, WebhookPayload, DeadLetterEntry, WebhookDeliveryStatus } from './webhook.types.js';
+import { WebhookStore } from './webhook.store.js';
 import { logger } from '../logger.js';
 
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 1000;
+const MAX_DELAY_MS = 30000; // Cap maximum backoff at 30 seconds
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// Calculate exponential backoff with jitter to avoid thundering herd
+function calculateBackoff(attempt: number): number {
+    const exponentialDelay = BASE_DELAY_MS * Math.pow(2, attempt);
+    // Add jitter: random value between 0-25% of the exponential delay
+    const jitter = Math.random() * 0.25 * exponentialDelay;
+    const delayWithJitter = exponentialDelay + jitter;
+    // Cap at maximum delay
+    return Math.min(delayWithJitter, MAX_DELAY_MS);
+}
+
 function signPayload(secret: string, body: string): string {
     return crypto.createHmac('sha256', secret).update(body).digest('hex');
+}
+
+function generateDeadLetterId(): string {
+    return `dl_${crypto.randomUUID()}`;
 }
 
 export async function dispatchWebhook(
@@ -31,6 +46,7 @@ export async function dispatchWebhook(
     }
 
     let lastError: unknown;
+    let lastAttemptAt = new Date();
 
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
@@ -60,14 +76,33 @@ export async function dispatchWebhook(
         }
 
         if (attempt < MAX_RETRIES - 1) {
-            const delay = BASE_DELAY_MS * Math.pow(2, attempt); // exponential backoff
-            console.log(`[webhook] Retrying in ${delay}ms...`);
+            const delay = calculateBackoff(attempt);
+            console.log(`[webhook] Retrying in ${delay.toFixed(0)}ms...`);
             await sleep(delay);
+            lastAttemptAt = new Date();
         }
     }
 
+    // All retries exhausted - move to dead-letter queue
+    const errorMessage = lastError instanceof Error ? lastError.message : String(lastError);
+    
+    const deadLetterEntry: DeadLetterEntry = {
+        id: generateDeadLetterId(),
+        webhookConfigId: config.developerId,
+        url: config.url,
+        event: payload.event,
+        payload,
+        status: 'dead_letter' as WebhookDeliveryStatus,
+        attempts: MAX_RETRIES,
+        lastError: errorMessage,
+        lastAttemptAt,
+        deadLetterAt: new Date(),
+    };
+
+    WebhookStore.addDeadLetterEntry(deadLetterEntry);
+
     logger.error(
-        `[webhook] ✗ Failed to deliver ${payload.event} to ${config.url} after ${MAX_RETRIES} attempts.`,
+        `[webhook] ✗ Failed to deliver ${payload.event} to ${config.url} after ${MAX_RETRIES} attempts. Moved to dead-letter queue.`,
         lastError
     );
 }

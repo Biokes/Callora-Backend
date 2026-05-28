@@ -181,4 +181,41 @@ describe('adminAuth middleware — unit', () => {
       expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
     });
   });
+
+  // ── Timing-safe comparison regression ──────────────────────────────────────
+
+  describe('timing-safe key comparison', () => {
+    it('rejects a key that is a prefix of the real key (length mismatch)', () => {
+      const res = makeRes();
+      // Submitting a prefix of the real key must not pass
+      adminAuth(makeReq({ 'x-admin-api-key': TEST_API_KEY.slice(0, -1) }), res, next);
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    });
+
+    it('rejects a key that is the real key with an extra character appended', () => {
+      const res = makeRes();
+      adminAuth(makeReq({ 'x-admin-api-key': TEST_API_KEY + 'x' }), res, next);
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    });
+
+    it('rejects an empty key even when ADMIN_API_KEY is set', () => {
+      const res = makeRes();
+      adminAuth(makeReq({ 'x-admin-api-key': '' }), res, next);
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    });
+
+    it('rejects when ADMIN_API_KEY env var is unset regardless of submitted key', () => {
+      delete process.env.ADMIN_API_KEY;
+      const res = makeRes();
+      adminAuth(makeReq({ 'x-admin-api-key': 'any-key' }), res, next);
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ statusCode: 401 }));
+    });
+
+    it('accepts the exact key (sanity check for timing-safe path)', () => {
+      const res = makeRes();
+      adminAuth(makeReq({ 'x-admin-api-key': TEST_API_KEY }), res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.status).not.toHaveBeenCalled();
+    });
+  });
 });

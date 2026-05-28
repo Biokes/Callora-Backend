@@ -24,30 +24,8 @@ export const WebhookStore = {
         return [...store.values()];
     },
 
-    // Dead-letter queue management
-    addDeadLetterEntry(entry: DeadLetterEntry): void {
-        deadLetterStore.set(entry.id, entry);
-    },
-
-    getDeadLetterEntry(id: string): DeadLetterEntry | undefined {
-        return deadLetterStore.get(id);
-    },
-
-    listDeadLetterEntries(): DeadLetterEntry[] {
-        return [...deadLetterStore.values()];
-    },
-
-    getDeadLetterEntriesByWebhook(webhookConfigId: string): DeadLetterEntry[] {
-        return [...deadLetterStore.values()].filter(
-            (entry) => entry.webhookConfigId === webhookConfigId
-        );
-    },
-
-    removeDeadLetterEntry(id: string): void {
-        deadLetterStore.delete(id);
-    },
-
-    clearDeadLetterQueue(): void {
-        deadLetterStore.clear();
+    /** Clear all webhook configurations - for testing only */
+    clear(): void {
+        store.clear();
     },
 };

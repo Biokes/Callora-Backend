@@ -12,7 +12,11 @@
     "db:studio": "drizzle-kit studio",
     "typecheck": "tsc --noEmit",
     "validate:issue-9": "node scripts/validate-issue-9.mjs",
-    "test": "jest --runInBand"
+    "test": "jest --forceExit",
+    "test:serial": "jest --runInBand --forceExit",
+    "test:unit": "jest --runInBand --forceExit --testPathIgnorePatterns tests/integration",
+    "test:integration": "jest --runInBand --forceExit tests/integration",
+    "test:coverage": "jest --runInBand --coverage --forceExit --testPathIgnorePatterns tests/integration"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.4.1",
@@ -32,7 +36,8 @@
     "pino": "^10.3.1",
     "prisma": "^7.4.1",
     "prom-client": "^15.1.0",
-    "uuid": "^13.0.0"
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/axios": "^0.9.36",
@@ -59,6 +64,7 @@
     "ts-jest": "^29.4.6",
     "tsx": "^4.7.0",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.56.1"
+    "typescript-eslint": "^8.56.1",
+    "fast-check": "^3.22.0"
   }
 }

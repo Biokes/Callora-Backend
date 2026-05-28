@@ -1,24 +1,45 @@
-import { PrismaClient } from '../generated/prisma/client.js';
+import { createRequire } from 'node:module';
 import { PrismaPg } from '@prisma/adapter-pg';
 
-let prisma: PrismaClient;
+type PrismaClientLike = {
+  $disconnect: () => Promise<void>;
+  [key: string]: unknown;
+};
 
-function getPrismaClient(): PrismaClient {
+let prisma: PrismaClientLike | undefined;
+const nodeRequire: NodeRequire =
+  typeof require === 'function'
+    ? require
+    : createRequire(`${process.cwd()}/package.json`);
+
+type PrismaClientConstructor = new (options?: unknown) => PrismaClientLike;
+
+function getPrismaClient(): PrismaClientLike {
   if (!prisma) {
     const connectionString = process.env.DATABASE_URL;
     if (!connectionString) {
-      throw new Error('DATABASE_URL environment variable is required');
+      throw new Error("DATABASE_URL environment variable is required");
     }
     const adapter = new PrismaPg({ connectionString });
-    prisma = new PrismaClient({ adapter });
+    const { PrismaClient } = nodeRequire('../generated/prisma/client.js') as {
+      PrismaClient: PrismaClientConstructor;
+    };
+    prisma = new PrismaClient({ adapter }) as unknown as PrismaClientLike;
   }
   return prisma;
 }
 
-export default new Proxy({} as PrismaClient, {
+export async function disconnectPrisma(): Promise<void> {
+  if (!prisma) {
+    return;
+  }
+  await prisma.$disconnect();
+}
+
+export default new Proxy({} as PrismaClientLike, {
   get(_target, prop, receiver) {
     const client = getPrismaClient();
     const value = Reflect.get(client, prop, receiver);
-    return typeof value === 'function' ? value.bind(client) : value;
+    return typeof value === "function" ? value.bind(client) : value;
   },
 });

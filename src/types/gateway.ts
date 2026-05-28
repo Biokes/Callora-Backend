@@ -1,8 +1,12 @@
+import type { RequestHandler } from 'express';
+import type { Awaitable } from './awaitable.js';
+
 /** Represents a registered API key mapping to a developer and API. */
 export interface ApiKey {
   key: string;
   developerId: string;
   apiId: string;
+  revoked?: boolean;
 }
 
 /** A single recorded usage event from a proxied request. */
@@ -26,6 +30,21 @@ export interface BillingResult {
   balance?: number;
 }
 
+export interface UsageChargeRequest {
+  requestId: string;
+  developerId: string;
+  apiId: string;
+  endpointId: string;
+  apiKeyId: string;
+  amountUsdc: number;
+}
+
+export interface UsageChargeResult extends BillingResult {
+  alreadyProcessed?: boolean;
+  reconciliationRequired?: boolean;
+  error?: string;
+}
+
 /** Result of a rate-limit check. */
 export interface RateLimitResult {
   allowed: boolean;
@@ -45,21 +64,23 @@ export interface BillingService {
   deductCredit(developerId: string, amount: number): Promise<BillingResult>;
   /** Check balance without deducting. */
   checkBalance(developerId: string): Promise<number>;
+  /** Anchor proxy usage charging to requestId when the billing backend supports it. */
+  chargeUsage?(request: UsageChargeRequest): Promise<UsageChargeResult>;
 }
 
 /** Interface for rate limiting. */
 export interface RateLimiter {
-  check(apiKey: string): RateLimitResult;
+  check(apiKey: string): Promise<RateLimitResult>;
 }
 
 /** Interface for recording and querying usage events. */
 export interface UsageStore {
   /** Record an event. Returns false if requestId already exists (idempotent). */
-  record(event: UsageEvent): boolean;
-  hasEvent(requestId: string): boolean;
-  getEvents(apiKey?: string): UsageEvent[];
-  getUnsettledEvents(): UsageEvent[];
-  markAsSettled(eventIds: string[], settlementId: string): void;
+  record(event: UsageEvent): Awaitable<boolean>;
+  hasEvent(requestId: string): Awaitable<boolean>;
+  getEvents(apiKey?: string): Awaitable<UsageEvent[]>;
+  getUnsettledEvents(): Awaitable<UsageEvent[]>;
+  markAsSettled(eventIds: string[], settlementId: string): Awaitable<void>;
 }
 
 /** A registered API with its upstream base URL and endpoint pricing. */
@@ -84,6 +105,8 @@ export interface ProxyConfig {
   stripHeaders: string[];
   /** Status code ranges to record metering for. Default: 2xx only. */
   recordableStatuses: (code: number) => boolean;
+  /** Hostnames/IPs the gateway is allowed to contact for proxied APIs. */
+  allowedHosts: string[];
 }
 
 /** Dependencies injected into the gateway router factory. */
@@ -92,7 +115,10 @@ export interface GatewayDeps {
   rateLimiter: RateLimiter;
   usageStore: UsageStore;
   upstreamUrl: string;
-  apiKeys: Map<string, ApiKey>;
+  apiKeys?: Map<string, ApiKey>;
+  authMiddleware?: RequestHandler;
+  /** Maximum allowed request body size (Express size string, e.g. '1mb', '512kb'). Default: '1mb'. */
+  maxBodySize?: string;
 }
 
 /** Dependencies injected into the proxy router factory. */
@@ -101,6 +127,7 @@ export interface ProxyDeps {
   rateLimiter: RateLimiter;
   usageStore: UsageStore;
   registry: ApiRegistry;
-  apiKeys: Map<string, ApiKey>;
+  apiKeys?: Map<string, ApiKey>;
+  authMiddleware?: RequestHandler;
   proxyConfig?: Partial<ProxyConfig>;
 }

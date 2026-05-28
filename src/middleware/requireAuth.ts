@@ -1,45 +1,46 @@
-import type { NextFunction, Request, Response } from 'express';
-import jwt from 'jsonwebtoken';
+import type { NextFunction, Request, Response } from "express";
+import jwt from "jsonwebtoken";
 
-import type { AuthenticatedUser } from '../types/auth.js';
-import { UnauthorizedError } from '../errors/index.js';
-import { logger } from '../logger.js';
+import type { AuthenticatedUser } from "../types/auth.js";
+import { UnauthorizedError } from "../errors/index.js";
+import { logger } from "../logger.js";
 
-export interface AuthenticatedLocals {
+// Re-export the locals shape for files that import it from this module
+export type AuthenticatedLocals = {
   authenticatedUser?: AuthenticatedUser;
-}
-
-// Extend Express Request to carry the authenticated developer id
-declare module 'express-serve-static-core' {
-  interface Request {
-    developerId?: string;
-  }
-}
+};
 
 /** Restrict accepted signing algorithms to prevent algorithm-confusion attacks. */
-const ALLOWED_ALGORITHMS: jwt.Algorithm[] = ['HS256'];
+const ALLOWED_ALGORITHMS: jwt.Algorithm[] = ["HS256"];
 
-export const requireAuth = (
-  req: Request,
-  res: Response<unknown, AuthenticatedLocals>,
-  next: NextFunction
-): void => {
-  let userId: string | undefined;
+export interface ResolvedRequestUserId {
+  userId?: string;
+  error?: UnauthorizedError;
+}
 
-  const authHeader = req.header('authorization');
-  if (authHeader?.startsWith('Bearer ')) {
-    const token = authHeader.slice('Bearer '.length).trim();
+export function resolveRequestUserId(req: Request): ResolvedRequestUserId {
+  const authHeader = req.header("authorization");
+  if (authHeader !== undefined) {
+    if (!authHeader.startsWith("Bearer ")) {
+      return {
+        error: new UnauthorizedError(
+          "Invalid authorization header",
+          "INVALID_AUTH_HEADER",
+        ),
+      };
+    }
 
+    const token = authHeader.slice("Bearer ".length).trim();
     if (!token) {
-      next(new UnauthorizedError('Missing token', 'MISSING_TOKEN'));
-      return;
+      return {
+        error: new UnauthorizedError("Missing token", "MISSING_TOKEN"),
+      };
     }
 
     const secret = process.env.JWT_SECRET;
     if (!secret) {
-      logger.error('[requireAuth] JWT_SECRET is not configured');
-      next(new UnauthorizedError());
-      return;
+      logger.error("[requireAuth] JWT_SECRET is not configured");
+      return { error: new UnauthorizedError() };
     }
 
     try {
@@ -47,38 +48,58 @@ export const requireAuth = (
         algorithms: ALLOWED_ALGORITHMS,
       });
 
-      // jwt.verify can return a plain string for unsigned payloads
-      if (typeof decoded === 'string' || !decoded) {
-        logger.warn('[requireAuth] Token payload is not a valid object');
-        next(new UnauthorizedError('Invalid token', 'INVALID_TOKEN'));
-        return;
+      if (typeof decoded === "string" || !decoded) {
+        logger.warn("[requireAuth] Token payload is not a valid object");
+        return {
+          error: new UnauthorizedError("Invalid token", "INVALID_TOKEN"),
+        };
       }
 
-      const uid = (decoded as Record<string, unknown>).userId;
-      if (typeof uid !== 'string' || uid.trim() === '') {
-        logger.warn('[requireAuth] Token missing required userId claim');
-        next(new UnauthorizedError('Token missing required claims', 'MISSING_CLAIMS'));
-        return;
+      const payload = decoded as Record<string, unknown>;
+      const uid = payload.userId || payload.sub;
+
+      if (typeof uid !== "string" || uid.trim() === "") {
+        logger.warn("[requireAuth] Token missing required userId or sub claim");
+        return {
+          error: new UnauthorizedError(
+            "Token missing required claims",
+            "MISSING_CLAIMS",
+          ),
+        };
       }
 
-      userId = uid;
+      return { userId: uid };
     } catch (err) {
-      // Log the failure reason but never the token contents
-      const code = err instanceof jwt.TokenExpiredError
-        ? 'TOKEN_EXPIRED'
-        : err instanceof jwt.NotBeforeError
-          ? 'TOKEN_NOT_ACTIVE'
-          : 'INVALID_TOKEN';
+      const code =
+        err instanceof jwt.TokenExpiredError
+          ? "TOKEN_EXPIRED"
+          : err instanceof jwt.NotBeforeError
+            ? "TOKEN_NOT_ACTIVE"
+            : "INVALID_TOKEN";
 
-      logger.warn('[requireAuth] JWT verification failed', { code });
-      next(new UnauthorizedError(
-        code === 'TOKEN_EXPIRED' ? 'Token expired' : 'Invalid token',
-        code,
-      ));
-      return;
+      logger.warn("[requireAuth] JWT verification failed", { code });
+      return {
+        error: new UnauthorizedError(
+          code === "TOKEN_EXPIRED" ? "Token expired" : "Invalid token",
+          code,
+        ),
+      };
     }
-  } else {
-    userId = req.header('x-user-id');
+  }
+
+  const forwardedUserId = req.header("x-user-id")?.trim();
+  return forwardedUserId ? { userId: forwardedUserId } : {};
+}
+
+export const requireAuth = (
+  req: Request,
+  res: Response<unknown, AuthenticatedLocals>,
+  next: NextFunction,
+): void => {
+  const { userId, error } = resolveRequestUserId(req);
+  if (error) {
+    next(error);
+    return;
   }
 
   if (!userId) {

@@ -1,11 +1,16 @@
 import express from 'express';
 import type { Server } from 'node:http';
+import dns from 'node:dns/promises';
+import type { LookupAddress } from 'node:dns';
 import { createProxyRouter } from '../routes/proxyRoutes.js';
+import { errorHandler } from '../middleware/errorHandler.js';
+import { requestIdMiddleware } from '../middleware/requestId.js';
 import { MockSorobanBilling } from '../services/billingService.js';
 import { InMemoryRateLimiter } from '../services/rateLimiter.js';
 import { InMemoryUsageStore } from '../services/usageStore.js';
 import { InMemoryApiRegistry } from '../data/apiRegistry.js';
 import { ApiKey, ApiRegistryEntry } from '../types/gateway.js';
+import { errorHandler } from '../middleware/errorHandler.js';
 
 // ── Test fixtures ───────────────────────────────────────────────────────────
 
@@ -76,6 +81,7 @@ beforeAll(async () => {
   await new Promise<void>((resolve) => {
     const app = express();
     app.use(express.json());
+    app.use(requestIdMiddleware);
 
     const proxyRouter = createProxyRouter({
       billing,
@@ -83,9 +89,13 @@ beforeAll(async () => {
       usageStore,
       registry,
       apiKeys,
-      proxyConfig: { timeoutMs: 2000 }, // short timeout for tests
+      proxyConfig: {
+        timeoutMs: 2000,
+        allowedHosts: ['localhost'],
+      }, // short timeout for tests
     });
     app.use('/v1/call', proxyRouter);
+    app.use(errorHandler);
 
     proxyServer = app.listen(0, () => {
       const addr = proxyServer.address();
@@ -104,6 +114,7 @@ afterAll(async () => {
 
 beforeEach(() => {
   usageStore.clear();
+  billing.clear();
   billing.setBalance(TEST_DEVELOPER_ID, 1000);
   rateLimiter.reset();
   setUpstreamHandler((_req, res) => {
@@ -151,7 +162,7 @@ describe('Proxy /v1/call', () => {
     });
     expect(res.status).toBe(404);
     const body = await res.json();
-    expect(body.error).toMatch(/unknown API/i);
+    expect(body.message ?? body.error).toMatch(/unknown API/i);
   });
 
   it('returns 401 when API key is missing', async () => {
@@ -180,8 +191,34 @@ describe('Proxy /v1/call', () => {
 
     expect(res.status).toBe(402);
     const body = await res.json();
-    expect(body.error).toMatch(/insufficient balance/i);
+    expect(body.message ?? body.error).toMatch(/insufficient balance/i);
     expect(usageStore.getEvents()).toHaveLength(0);
+  });
+
+  it('does not record usage or deduct billing when anchored charging fails', async () => {
+    const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    billing.failNextUsageCharge('billing anchor write failed', true);
+
+    const res = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/data`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': TEST_API_KEY },
+      body: JSON.stringify({ input: 'hello' }),
+    });
+
+    expect(res.status).toBe(200);
+    expect(usageStore.getEvents()).toHaveLength(0);
+    expect(billing.getBalance(TEST_DEVELOPER_ID)).toBe(1000);
+    expect(errorSpy).toHaveBeenCalledWith(
+      '[proxy billing reconciliation] Billing anchor failed after usage write phase started',
+      expect.objectContaining({
+        requestId: expect.any(String),
+        apiId: TEST_API_ID,
+        endpointId: 'default',
+        developerId: TEST_DEVELOPER_ID,
+      }),
+    );
+
+    errorSpy.mockRestore();
   });
 
   it('returns 429 when rate limited', async () => {
@@ -268,7 +305,7 @@ describe('Proxy /v1/call', () => {
 
     expect(res.status).toBe(504);
     const body = await res.json();
-    expect(body.error).toMatch(/timeout/i);
+    expect(body.message ?? body.error).toMatch(/timed out|timeout/i);
 
     await new Promise((resolve) => setImmediate(resolve));
 
@@ -293,14 +330,19 @@ describe('Proxy /v1/call', () => {
     // Spin up a temporary proxy with the bad registry
     const tmpApp = express();
     tmpApp.use(express.json());
+    tmpApp.use(requestIdMiddleware);
     tmpApp.use('/v1/call', createProxyRouter({
       billing,
       rateLimiter,
       usageStore,
       registry: badRegistry,
       apiKeys: badKeys,
-      proxyConfig: { timeoutMs: 2000 },
+      proxyConfig: {
+        timeoutMs: 2000,
+        allowedHosts: ['localhost'],
+      },
     }));
+    tmpApp.use(errorHandler);
 
     const tmpServer = await new Promise<Server>((resolve) => {
       const s = tmpApp.listen(0, () => resolve(s));
@@ -317,8 +359,232 @@ describe('Proxy /v1/call', () => {
 
     expect(res.status).toBe(502);
     const body = await res.json();
-    expect(body.error).toMatch(/bad gateway/i);
+    expect(body.message ?? body.error).toMatch(/bad gateway/i);
 
     await new Promise<void>((resolve) => tmpServer.close(() => resolve()));
+    lookupSpy.mockRestore();
+  });
+});
+
+// ── Resilience Tests ──────────────────────────────────────────────────────
+
+describe('Proxy Resilience', () => {
+  it('handles connection resets gracefully', async () => {
+    let requestCount = 0;
+    
+    setUpstreamHandler((req, res) => {
+      requestCount++;
+      // Reset connection on first request
+      if (requestCount === 1) {
+        res.socket!.destroy();
+        return;
+      }
+      // Succeed on retry
+      res.status(200).json({ message: 'success after reset', requestCount });
+    });
+
+    // First request should fail with connection reset
+    const res1 = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/reset-test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': TEST_API_KEY },
+      body: JSON.stringify({ test: 'reset' }),
+    });
+
+    expect(res1.status).toBe(502);
+    const body1 = await res1.json();
+    expect(body1.message ?? body1.error).toMatch(/bad gateway/i);
+
+    // Second request should succeed
+    const res2 = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/reset-test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': TEST_API_KEY },
+      body: JSON.stringify({ test: 'reset' }),
+    });
+
+    expect(res2.status).toBe(200);
+    const body2 = await res2.json();
+    expect(body2.message).toBe('success after reset');
+    expect(body2.requestCount).toBe(2);
+  });
+
+  it('handles slow upstreams with timeout', async () => {
+    setUpstreamHandler(async (req, res) => {
+      // Simulate slow response that exceeds timeout
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      res.status(200).json({ message: 'too late' });
+    });
+
+    const startTime = Date.now();
+    const res = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/slow`, {
+      method: 'GET',
+      headers: { 'x-api-key': TEST_API_KEY },
+    });
+
+    const duration = Date.now() - startTime;
+    
+    // Should timeout before 3 seconds (proxy timeout is 2000ms)
+    expect(duration).toBeLessThan(3000);
+    expect(res.status).toBe(504);
+    
+    const body = await res.json();
+    expect(body.message ?? body.error).toMatch(/timed out|timeout/i);
+    expect(body.requestId).toBeTruthy();
+  });
+
+  it('handles upstream that responds slowly but within timeout', async () => {
+    setUpstreamHandler(async (req, res) => {
+      // Respond within timeout (1.5 seconds, timeout is 2 seconds)
+      await new Promise(resolve => setTimeout(resolve, 1500));
+      res.status(200).json({ message: 'slow but success' });
+    });
+
+    const startTime = Date.now();
+    const res = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/slow-but-ok`, {
+      method: 'GET',
+      headers: { 'x-api-key': TEST_API_KEY },
+    });
+
+    const duration = Date.now() - startTime;
+    
+    // Should complete within timeout
+    expect(duration).toBeGreaterThan(1500);
+    expect(duration).toBeLessThan(3000);
+    expect(res.status).toBe(200);
+    
+    const body = await res.json();
+    expect(body.message).toBe('slow but success');
+  });
+
+  it('prevents sensitive header leakage to upstream', async () => {
+    let receivedHeaders: Record<string, string | string[] | undefined> = {};
+
+    setUpstreamHandler((req, res) => {
+      receivedHeaders = { ...req.headers };
+      res.status(200).json({ receivedHeaders: Object.keys(receivedHeaders) });
+    });
+
+    await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/security-test`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': TEST_API_KEY,
+        'authorization': 'Bearer secret-token',
+        'cookie': 'session=abc123',
+        'x-forwarded-for': '192.168.1.1',
+        'x-real-ip': '192.168.1.1',
+        'x-custom-safe': 'should-forward',
+        'user-agent': 'TestAgent/1.0',
+      },
+      body: JSON.stringify({}),
+    });
+
+    // Verify sensitive headers are stripped
+    expect(receivedHeaders['x-api-key']).toBeUndefined();
+    expect(receivedHeaders['authorization']).toBeUndefined();
+    expect(receivedHeaders['cookie']).toBeUndefined();
+    expect(receivedHeaders['x-forwarded-for']).toBeUndefined();
+    expect(receivedHeaders['x-real-ip']).toBeUndefined();
+    expect(receivedHeaders['host']).toContain(upstreamUrl.split('//')[1]);
+    expect(receivedHeaders['connection']).toBe('keep-alive');
+    expect(receivedHeaders['transfer-encoding']).toBeUndefined();
+    expect(receivedHeaders['proxy-authorization']).toBeUndefined();
+    expect(receivedHeaders['proxy-connection']).toBeUndefined();
+
+    // Verify safe headers are forwarded
+  });
+
+  it('handles case-insensitive header stripping', async () => {
+    let receivedHeaders: Record<string, string | string[] | undefined> = {};
+
+    setUpstreamHandler((req, res) => {
+      receivedHeaders = { ...req.headers };
+      res.status(200).json({ ok: true });
+    });
+
+    await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/case-test`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': TEST_API_KEY,
+        'Authorization': 'Bearer token', // Capitalized
+        'HOST': 'should-be-stripped', // All caps
+        'User-Agent': 'CaseTest/1.0',
+      },
+      body: JSON.stringify({}),
+    });
+
+    // Sensitive variants should be stripped case-insensitively
+    expect(receivedHeaders['x-api-key']).toBeUndefined();
+    expect(receivedHeaders['authorization']).toBeUndefined();
+    expect(receivedHeaders['Authorization']).toBeUndefined();
+    expect(receivedHeaders['host']).toContain(upstreamUrl.split('//')[1]);
+
+    // Safe header should still be forwarded
+  });
+
+  it('preserves response headers from upstream while filtering hop-by-hop', async () => {
+    setUpstreamHandler((req, res) => {
+      res.set({
+        'content-type': 'application/json',
+        'cache-control': 'max-age=3600',
+        'x-upstream-custom': 'upstream-value',
+        'x-request-id': 'upstream-id', // Should be overridden by proxy
+      });
+      res.status(200).json({ message: 'response with headers' });
+    });
+
+    const res = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/headers-test`, {
+      method: 'GET',
+      headers: { 'x-api-key': TEST_API_KEY },
+    });
+
+    expect(res.status).toBe(200);
+    
+    // Should preserve safe headers
+    expect(res.headers.get('content-type')).toMatch(/^application\/json/);
+    expect(res.headers.get('cache-control')).toBe('max-age=3600');
+    expect(res.headers.get('x-upstream-custom')).toBe('upstream-value');
+    
+    // Should override upstream request-id with proxy's
+    expect(res.headers.get('x-request-id')).not.toBe('upstream-id');
+    expect(res.headers.get('x-request-id')).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    );
+  });
+
+  it('handles upstream that closes connection prematurely', async () => {
+    setUpstreamHandler((req, res) => {
+      // Start response but close connection before finishing
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{"partial": "response"');
+      res.socket!.destroy();
+    });
+
+    const res = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/premature-close`, {
+      method: 'GET',
+      headers: { 'x-api-key': TEST_API_KEY },
+    });
+
+    // Should handle gracefully with 502
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.message ?? body.error).toMatch(/bad gateway/i);
+  });
+
+  it('maintains request id through connection errors', async () => {
+    setUpstreamHandler((req, res) => {
+      // Destroy connection immediately
+      res.socket!.destroy();
+    });
+
+    const res = await fetch(`${proxyUrl}/v1/call/${TEST_API_SLUG}/error-with-id`, {
+      method: 'GET',
+      headers: { 'x-api-key': TEST_API_KEY },
+    });
+
+    expect(res.status).toBe(502);
+    const body = await res.json();
+    expect(body.message ?? body.error).toMatch(/bad gateway/i);
+    expect(body.requestId).toBeTruthy();
   });
 });

@@ -6,7 +6,7 @@ export type WebhookEventType =
 export interface WebhookConfig {
     developerId: string;
     url: string;
-    events: WebhookEventType[];
+    events: string[];
     secret?: string; // for HMAC signature (optional but recommended)
     createdAt: Date;
 }
@@ -40,21 +40,4 @@ export interface LowBalanceAlertData {
     currentBalance: string;
     thresholdBalance: string;
     asset: string;
-}
-
-// Delivery status for webhook attempts
-export type WebhookDeliveryStatus = 'pending' | 'delivered' | 'dead_letter';
-
-// Dead-letter entry for permanently failed webhook deliveries
-export interface DeadLetterEntry {
-    id: string;
-    webhookConfigId: string; // developerId from WebhookConfig
-    url: string;
-    event: WebhookEventType;
-    payload: WebhookPayload;
-    status: WebhookDeliveryStatus;
-    attempts: number;
-    lastError: string;
-    lastAttemptAt: Date;
-    deadLetterAt: Date;
 }

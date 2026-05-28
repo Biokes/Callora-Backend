@@ -3,6 +3,8 @@ import request from 'supertest';
 import express from 'express';
 import { createTestDb } from '../helpers/db.js';
 import { randomUUID } from 'crypto';
+import { GatewayTimeoutError } from '../../src/errors/index.js';
+import { errorHandler } from '../../src/middleware/errorHandler.js';
 
 function buildGatewayApp(pool: any) {
   const app = express();
@@ -41,6 +43,10 @@ function buildGatewayApp(pool: any) {
     return res.status(200).json({ data: 'protected gateway response' });
   });
 
+  app.get('/gateway/timeout', apiKeyGuard, (_req, _res) => {
+    throw new GatewayTimeoutError('Upstream service timed out');
+  });
+
   // Expose usage count directly for testing
   app.get('/gateway/usage/:keyId', async (req, res) => {
     const result = await pool.query(
@@ -49,6 +55,8 @@ function buildGatewayApp(pool: any) {
     );
     return res.status(200).json({ count: parseInt(result.rows[0].count) });
   });
+
+  app.use(errorHandler);
 
   return app;
 }
@@ -86,6 +94,16 @@ describe('Gateway X-Api-Key auth', () => {
     const res = await request(app).get('/gateway/data').set('x-api-key', validKey);
     expect(res.status).toBe(200);
     expect(res.body.data).toBe('protected gateway response');
+  });
+
+  it('should return 504 Gateway Timeout when the upstream request times out', async () => {
+    const res = await request(app)
+      .get('/gateway/timeout')
+      .set('x-api-key', validKey);
+
+    expect(res.status).toBe(504);
+    expect(res.body.error).toMatch(/timeout|timed out/i);
+    expect(res.body).toHaveProperty('requestId');
   });
 
   it('logs usage on valid key request', async () => {
@@ -128,5 +146,20 @@ describe('Gateway X-Api-Key auth', () => {
       [validKeyId]
     );
     expect(parseInt(result.rows[0].count)).toBe(3);
+  });
+
+  it('does not regress auth or usage logging for large authenticated headers', async () => {
+    const res = await request(app)
+      .get('/gateway/data')
+      .set('x-api-key', validKey)
+      .set('x-test-context', 'x'.repeat(8 * 1024));
+
+    expect(res.status).toBe(200);
+
+    const result = await db.pool.query(
+      `SELECT COUNT(*) as count FROM usage_logs WHERE api_key_id = $1`,
+      [validKeyId]
+    );
+    expect(parseInt(result.rows[0].count)).toBe(1);
   });
 });

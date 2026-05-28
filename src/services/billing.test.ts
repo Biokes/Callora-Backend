@@ -1,316 +1,470 @@
 /**
- * Billing Service Unit Tests
- * 
- * Comprehensive test coverage for idempotent billing functionality
+ * BillingService unit tests
+ *
+ * Transaction-boundary design under test
+ * Phase 1 (DB tx):   BEGIN -> SELECT FOR UPDATE -> SELECT 1 -> INSERT -> COMMIT
+ * Phase 2 (external): sorobanClient.getBalance() + deductBalance()  <- outside tx
+ * Phase 3 (best-effort): UPDATE stellar_tx_hash  <- no tx, logged on failure
  */
 
 import assert from 'node:assert/strict';
 import type { Pool, PoolClient, QueryResult } from 'pg';
-import { BillingService, type BillingDeductRequest, type SorobanClient } from './billing.js';
 
-// Mock PoolClient
-function createMockClient(
-  queryResults: (QueryResult | Error)[],
-  _commitError?: Error,
-  _rollbackError?: Error
-): PoolClient {
-  let queryIndex = 0;
+import {
+  BillingService,
+  billingInternals,
+  type BillingDeductRequest,
+  type SorobanClient,
+} from './billing.js';
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeQr(rows: Record<string, unknown>[] = []): QueryResult {
+  return { rows, rowCount: rows.length, command: '', oid: 0, fields: [] } as QueryResult;
+}
+
+function createMockClient(queryResults: (QueryResult | Error)[]): PoolClient {
+  let idx = 0;
   return {
     query: async (_sql: string, _params?: unknown[]) => {
-      if (queryIndex >= queryResults.length) {
-        throw new Error('Unexpected query call');
-      }
-
-      const result = queryResults[queryIndex++];
-      if (result instanceof Error) {
-        throw result;
-      }
-
-      // Simulate delay
-      await new Promise((resolve) => setTimeout(resolve, 1));
+      if (idx >= queryResults.length) throw new Error(`Unexpected query #${idx}`);
+      const result = queryResults[idx++];
+      if (result instanceof Error) throw result;
       return result;
     },
     release: () => {},
-  } as PoolClient;
+  } as unknown as PoolClient;
 }
 
-// Mock Pool
-function createMockPool(client: PoolClient): Pool {
+function createMockPool(
+  client: PoolClient,
+  poolQueryResults: (QueryResult | Error)[] = [],
+): Pool {
+  let idx = 0;
   return {
     connect: async () => client,
-    query: async () => ({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult),
+    query: async (_sql: string, _params?: unknown[]) => {
+      if (idx >= poolQueryResults.length) return makeQr();
+      const result = poolQueryResults[idx++];
+      if (result instanceof Error) throw result;
+      return result;
+    },
   } as unknown as Pool;
 }
 
-// Mock Soroban Client
-function createMockSorobanClient(
-  txHash: string = 'tx_abc123',
-  shouldFail: boolean = false
-): SorobanClient {
-  return {
-    deductBalance: async (userId: string, amount: string) => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      if (shouldFail) {
-        throw new Error('Soroban deduction failed');
-      }
-      return txHash;
+function createMockSorobanClient(options?: {
+  balance?: string;
+  txHash?: string;
+  deductFailures?: Error[];
+  balanceFailure?: Error;
+}) {
+  let deductCount = 0;
+  let balanceCount = 0;
+  const failures = [...(options?.deductFailures ?? [])];
+
+  const client: SorobanClient = {
+    getBalance: async () => {
+      balanceCount += 1;
+      if (options?.balanceFailure) throw options.balanceFailure;
+      return { balance: options?.balance ?? '1000000' };
+    },
+    deductBalance: async () => {
+      deductCount += 1;
+      const failure = failures.shift();
+      if (failure) throw failure;
+      return { txHash: options?.txHash ?? 'tx_abc123' };
     },
   };
+
+  return { client, getDeductCount: () => deductCount, getBalanceCount: () => balanceCount };
 }
 
-describe('BillingService.deduct', () => {
-  test('successfully deducts balance for new request', async () => {
+const baseRequest: BillingDeductRequest = {
+  requestId: 'req_123',
+  userId: 'user_abc',
+  apiId: 'api_xyz',
+  endpointId: 'endpoint_001',
+  apiKeyId: 'key_789',
+  amountUsdc: '0.0100000',
+};
+
+// ---------------------------------------------------------------------------
+// billingInternals
+// ---------------------------------------------------------------------------
+
+describe('billingInternals', () => {
+  test('converts 7-decimal USDC strings to contract units', () => {
+    assert.equal(billingInternals.parseUsdcToContractUnits('1.2345678').toString(), '12345678');
+  });
+
+  test('detects transient Soroban errors', () => {
+    assert.equal(billingInternals.isTransientSorobanError(new Error('socket hang up')), true);
+    assert.equal(billingInternals.isTransientSorobanError(new Error('insufficient balance')), false);
+  });
+
+  test('parses smallest on-chain units correctly', () => {
+    assert.equal(billingInternals.parseUsdcToContractUnits('0.0000001').toString(), '1');
+    assert.equal(billingInternals.parseUsdcToContractUnits('1').toString(), '10000000');
+    assert.equal(billingInternals.parseUsdcToContractUnits('1.0000000').toString(), '10000000');
+    assert.equal(billingInternals.parseUsdcToContractUnits('  1.23  ').toString(), '12300000');
+  });
+
+  test('rejects invalid USDC values', () => {
+    assert.throws(() => billingInternals.parseUsdcToContractUnits('0'), {
+      message: 'amountUsdc must be greater than zero',
+    });
+    assert.throws(() => billingInternals.parseUsdcToContractUnits('-1.0'), {
+      message: 'amountUsdc must be a positive decimal with at most 7 fractional digits',
+    });
+    assert.throws(() => billingInternals.parseUsdcToContractUnits('0.00000001'), {
+      message: 'amountUsdc must be a positive decimal with at most 7 fractional digits',
+    });
+    assert.throws(() => billingInternals.parseUsdcToContractUnits('abc'), {
+      message: 'amountUsdc must be a positive decimal with at most 7 fractional digits',
+    });
+  });
+
+  test('rejects all zero decimal forms', () => {
+    const zeroForms = ['0.0', '0.00', '0.0000000'];
+    for (const zero of zeroForms) {
+      assert.throws(
+        () => billingInternals.parseUsdcToContractUnits(zero),
+        { message: 'amountUsdc must be greater than zero' },
+        `expected "${zero}" to be rejected as zero`
+      );
+    }
+  });
+
+  test('rejects negative values and malformed inputs', () => {
+    const invalids = ['-0', '-0.0', '-0.0000001', '-1', '-1.0000000', '', '   ', 'NaN', 'Infinity', '-'];
+    for (const val of invalids) {
+      assert.throws(
+        () => billingInternals.parseUsdcToContractUnits(val),
+        { message: 'amountUsdc must be a positive decimal with at most 7 fractional digits' },
+        `expected "${val}" to be rejected as invalid format`
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BillingService.deduct - success path
+// ---------------------------------------------------------------------------
+
+describe('BillingService.deduct - success path', () => {
+  test('successfully deducts balance for a new request', async () => {
     const client = createMockClient([
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // BEGIN
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // Check existing
-      { rows: [{ id: 1 }], rowCount: 1, command: '', oid: 0, fields: [] } as QueryResult, // INSERT
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // UPDATE with tx hash
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // COMMIT
+      makeQr(),                    // BEGIN
+      makeQr(),                    // SELECT FOR UPDATE -> no existing row
+      makeQr(),                    // SELECT 1 placeholder
+      makeQr([{ id: 1 }]),         // INSERT RETURNING id
+      makeQr(),                    // COMMIT
     ]);
+    const pool = createMockPool(client, [makeQr()]); // Phase 3 UPDATE
+    const soroban = createMockSorobanClient({ balance: '500000', txHash: 'tx_stellar_123' });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
 
-    const pool = createMockPool(client);
-    const sorobanClient = createMockSorobanClient('tx_stellar_123');
-    const billingService = new BillingService(pool, sorobanClient);
-
-    const request: BillingDeductRequest = {
-      requestId: 'req_new_123',
-      userId: 'user_abc',
-      apiId: 'api_xyz',
-      endpointId: 'endpoint_001',
-      apiKeyId: 'key_789',
-      amountUsdc: '0.01',
-    };
-
-    const result = await billingService.deduct(request);
+    const result = await svc.deduct(baseRequest);
 
     assert.equal(result.success, true);
     assert.equal(result.usageEventId, '1');
     assert.equal(result.stellarTxHash, 'tx_stellar_123');
     assert.equal(result.alreadyProcessed, false);
+    assert.equal(soroban.getBalanceCount(), 1);
+    assert.equal(soroban.getDeductCount(), 1);
   });
 
-  test('returns existing result when request_id already exists', async () => {
+  test('Phase 3 UPDATE failure is logged but does not fail the deduction', async () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
     const client = createMockClient([
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // BEGIN
-      {
-        rows: [{ id: 42, stellar_tx_hash: 'tx_existing_456' }],
-        rowCount: 1,
-        command: '',
-        oid: 0,
-        fields: [],
-      } as QueryResult, // Check existing - found!
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // COMMIT
+      makeQr(), makeQr(), makeQr(), makeQr([{ id: 7 }]), makeQr(),
     ]);
+    const pool = createMockPool(client, [makeQr(), new Error('DB write timeout')]);
+    const soroban = createMockSorobanClient({ balance: '500000', txHash: 'tx_phase3_fail' });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
 
+    const result = await svc.deduct(baseRequest);
+
+    assert.equal(result.success, true);
+    assert.equal(result.usageEventId, '7');
+    assert.equal(result.stellarTxHash, 'tx_phase3_fail');
+    assert.equal(result.alreadyProcessed, false);
+    assert.ok(consoleSpy.mock.calls.some((args) => String(args[0]).includes('Phase 3')));
+
+    consoleSpy.mockRestore();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// BillingService.deduct - idempotency
+// ---------------------------------------------------------------------------
+
+describe('BillingService.deduct - idempotency', () => {
+  test('returns existing result when request_id already exists (SELECT FOR UPDATE hit)', async () => {
+    const client = createMockClient([
+      makeQr(),                                                        // BEGIN
+      makeQr([{ id: 42, stellar_tx_hash: 'tx_existing_456' }]),       // SELECT FOR UPDATE
+      makeQr(),                                                        // COMMIT
+    ]);
     const pool = createMockPool(client);
-    const sorobanClient = createMockSorobanClient();
-    const billingService = new BillingService(pool, sorobanClient);
+    const soroban = createMockSorobanClient();
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
 
-    const request: BillingDeductRequest = {
-      requestId: 'req_duplicate_123',
-      userId: 'user_abc',
-      apiId: 'api_xyz',
-      endpointId: 'endpoint_001',
-      apiKeyId: 'key_789',
-      amountUsdc: '0.01',
-    };
-
-    const result = await billingService.deduct(request);
+    const result = await svc.deduct(baseRequest);
 
     assert.equal(result.success, true);
     assert.equal(result.usageEventId, '42');
     assert.equal(result.stellarTxHash, 'tx_existing_456');
     assert.equal(result.alreadyProcessed, true);
+    assert.equal(soroban.getBalanceCount(), 1);
+    assert.equal(soroban.getDeductCount(), 0);
   });
 
-  test('rolls back transaction when Soroban call fails', async () => {
-    let queryCallCount = 0;
+  test('does not double-charge when same request_id is retried', async () => {
+    const inMemory = new Map<string, { id: number; stellar_tx_hash?: string }>();
+    let nextId = 1;
+
     const client = {
-      query: async (_sql: string, _params?: unknown[]) => {
-        queryCallCount++;
-        if (queryCallCount === 1) {
-          // BEGIN
-          return { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult;
-        } else if (queryCallCount === 2) {
-          // Check existing
-          return { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult;
-        } else if (queryCallCount === 3) {
-          // INSERT
-          return { rows: [{ id: 1 }], rowCount: 1, command: '', oid: 0, fields: [] } as QueryResult;
-        } else if (queryCallCount === 4) {
-          // ROLLBACK
-          return { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult;
+      query: async (sql: string, params: unknown[] = []) => {
+        if (/^BEGIN|^COMMIT|^ROLLBACK/.test(sql)) return makeQr();
+        if (sql.includes('FOR UPDATE') && params[0]) {
+          const row = inMemory.get(params[0] as string);
+          return makeQr(row ? [{ id: row.id, stellar_tx_hash: row.stellar_tx_hash ?? null }] : []);
         }
-        throw new Error('Unexpected query call');
+        if (sql.includes('SELECT 1')) return makeQr();
+        if (sql.includes('INSERT INTO usage_events')) {
+          const id = nextId++;
+          inMemory.set(params[5] as string, { id });
+          return makeQr([{ id }]);
+        }
+        throw new Error(`Unexpected client query: ${sql}`);
       },
       release: () => {},
     } as unknown as PoolClient;
 
-    const pool = createMockPool(client);
-    const sorobanClient = createMockSorobanClient('', true); // Will fail
-    const billingService = new BillingService(pool, sorobanClient);
+    const pool = {
+      connect: async () => client,
+      query: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('UPDATE usage_events')) {
+          const [txHash, id] = params as [string, number];
+          for (const v of inMemory.values()) {
+            if (v.id === id) v.stellar_tx_hash = txHash;
+          }
+          return makeQr();
+        }
+        if (sql.includes('FROM usage_events') && params[0]) {
+          const row = inMemory.get(params[0] as string);
+          return makeQr(row ? [{ id: row.id, stellar_tx_hash: row.stellar_tx_hash ?? null }] : []);
+        }
+        return makeQr();
+      },
+    } as unknown as Pool;
 
-    const request: BillingDeductRequest = {
-      requestId: 'req_fail_123',
-      userId: 'user_abc',
-      apiId: 'api_xyz',
-      endpointId: 'endpoint_001',
-      apiKeyId: 'key_789',
-      amountUsdc: '0.01',
-    };
+    const soroban = createMockSorobanClient({ balance: '500000', txHash: 'tx_first' });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
+    const req = { ...baseRequest, requestId: 'req_double' };
 
-    const result = await billingService.deduct(request);
+    const first = await svc.deduct(req);
+    assert.equal(first.success, true);
+    assert.equal(first.alreadyProcessed, false);
 
-    assert.equal(result.success, false);
-    assert.equal(result.alreadyProcessed, false);
-    assert.ok(result.error?.includes('Soroban'));
+    const second = await svc.deduct(req);
+    assert.equal(second.success, true);
+    assert.equal(second.alreadyProcessed, true);
+
+    assert.equal(soroban.getBalanceCount(), 1);
+    assert.equal(soroban.getDeductCount(), 1);
   });
 
-  test('handles race condition with unique constraint violation', async () => {
-    // Simulate race condition: unique constraint violation on insert
-    const uniqueViolationError = new Error('duplicate key value') as Error & {
-      code: string;
-    };
-    uniqueViolationError.code = '23505';
+  test('handles race condition with unique constraint violation (23505)', async () => {
+    const uniqueViolation = Object.assign(new Error('duplicate key value'), { code: '23505' });
 
     const client = createMockClient([
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // BEGIN
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // Check existing - not found
-      uniqueViolationError, // INSERT - unique violation!
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // ROLLBACK
-      {
-        rows: [{ id: 99, stellar_tx_hash: 'tx_race_789' }],
-        rowCount: 1,
-        command: '',
-        oid: 0,
-        fields: [],
-      } as QueryResult, // Query existing after race
+      makeQr(),         // BEGIN
+      makeQr(),         // SELECT FOR UPDATE -> empty
+      makeQr(),         // SELECT 1
+      uniqueViolation,  // INSERT -> unique violation
+      makeQr(),         // ROLLBACK
     ]);
+    const pool = createMockPool(client, [
+      makeQr([{ id: 99, stellar_tx_hash: 'tx_race_789' }]),
+    ]);
+    const soroban = createMockSorobanClient({ balance: '500000' });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
 
-    const pool = createMockPool(client);
-    const sorobanClient = createMockSorobanClient();
-    const billingService = new BillingService(pool, sorobanClient);
-
-    const request: BillingDeductRequest = {
-      requestId: 'req_race_123',
-      userId: 'user_abc',
-      apiId: 'api_xyz',
-      endpointId: 'endpoint_001',
-      apiKeyId: 'key_789',
-      amountUsdc: '0.01',
-    };
-
-    const result = await billingService.deduct(request);
+    const result = await svc.deduct(baseRequest);
 
     assert.equal(result.success, true);
     assert.equal(result.usageEventId, '99');
-    assert.equal(result.stellarTxHash, 'tx_race_789');
     assert.equal(result.alreadyProcessed, true);
-  });
-
-  test('handles database connection errors gracefully', async () => {
-    const client = createMockClient([
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // BEGIN
-      new Error('Connection lost'), // Check existing - connection error
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // ROLLBACK
-    ]);
-
-    const pool = createMockPool(client);
-    const sorobanClient = createMockSorobanClient();
-    const billingService = new BillingService(pool, sorobanClient);
-
-    const request: BillingDeductRequest = {
-      requestId: 'req_error_123',
-      userId: 'user_abc',
-      apiId: 'api_xyz',
-      endpointId: 'endpoint_001',
-      apiKeyId: 'key_789',
-      amountUsdc: '0.01',
-    };
-
-    const result = await billingService.deduct(request);
-
-    assert.equal(result.success, false);
-    assert.equal(result.error, 'Connection lost');
-  });
-
-  test('prevents double charge on retry with same request_id', async () => {
-    const client = createMockClient([
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // BEGIN (first call)
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // Check existing (first call)
-      { rows: [{ id: 1 }], rowCount: 1, command: '', oid: 0, fields: [] } as QueryResult, // INSERT (first call)
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // UPDATE (first call)
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // COMMIT (first call)
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // BEGIN (second call)
-      {
-        rows: [{ id: 1, stellar_tx_hash: 'tx_123' }],
-        rowCount: 1,
-        command: '',
-        oid: 0,
-        fields: [],
-      } as QueryResult, // Check existing (second call) - found!
-      { rows: [], rowCount: 0, command: '', oid: 0, fields: [] } as QueryResult, // COMMIT (second call)
-    ]);
-
-    const pool = createMockPool(client);
-    const sorobanClient = createMockSorobanClient('tx_123');
-    const billingService = new BillingService(pool, sorobanClient);
-
-    const request: BillingDeductRequest = {
-      requestId: 'req_retry_123',
-      userId: 'user_abc',
-      apiId: 'api_xyz',
-      endpointId: 'endpoint_001',
-      apiKeyId: 'key_789',
-      amountUsdc: '0.01',
-    };
-
-    // First call - processes normally
-    const result1 = await billingService.deduct(request);
-    assert.equal(result1.success, true);
-    assert.equal(result1.alreadyProcessed, false);
-
-    // Second call with same request_id - returns existing result
-    const result2 = await billingService.deduct(request);
-    assert.equal(result2.success, true);
-    assert.equal(result2.alreadyProcessed, true);
-    assert.equal(result2.usageEventId, result1.usageEventId);
   });
 });
 
-describe('BillingService.getByRequestId', () => {
-  test('returns existing usage event', async () => {
+// ---------------------------------------------------------------------------
+// BillingService.deduct - balance / Soroban failures
+// ---------------------------------------------------------------------------
+
+describe('BillingService.deduct - balance and Soroban failures', () => {
+  test('fails before Phase 1 when balance is insufficient', async () => {
     const pool = {
-      query: async () => ({
-        rows: [{ id: 123, stellar_tx_hash: 'tx_abc' }],
-        rowCount: 1,
-      }),
+      connect: async () => { throw new Error('should not connect'); },
+      query: async () => makeQr(),
     } as unknown as Pool;
 
-    const sorobanClient = createMockSorobanClient();
-    const billingService = new BillingService(pool, sorobanClient);
+    const soroban = createMockSorobanClient({ balance: '10' });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
 
-    const result = await billingService.getByRequestId('req_existing');
+    const result = await svc.deduct(baseRequest);
 
-    assert.ok(result !== null);
-    assert.equal(result.usageEventId, '123');
-    assert.equal(result.stellarTxHash, 'tx_abc');
-    assert.equal(result.alreadyProcessed, true);
+    assert.equal(result.success, false);
+    assert.ok(result.error?.includes('Insufficient balance'));
+    assert.equal(soroban.getBalanceCount(), 1);
+    assert.equal(soroban.getDeductCount(), 0);
   });
 
-  test('returns null when request_id not found', async () => {
+  test('fails gracefully when balance check itself throws', async () => {
     const pool = {
-      query: async () => ({
-        rows: [],
-        rowCount: 0,
-      }),
+      connect: async () => { throw new Error('should not connect'); },
+      query: async () => makeQr(),
     } as unknown as Pool;
 
-    const sorobanClient = createMockSorobanClient();
-    const billingService = new BillingService(pool, sorobanClient);
+    const soroban = createMockSorobanClient({
+      balanceFailure: new Error('Soroban RPC unreachable'),
+    });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
 
-    const result = await billingService.getByRequestId('req_nonexistent');
+    const result = await svc.deduct(baseRequest);
+
+    assert.equal(result.success, false);
+    assert.ok(result.error?.includes('Balance check failed'));
+    assert.ok(result.error?.includes('Soroban RPC unreachable'));
+  });
+
+  test('retries transient Soroban deduct failures with backoff', async () => {
+    const client = createMockClient([
+      makeQr(), makeQr(), makeQr(), makeQr([{ id: 1 }]), makeQr(),
+    ]);
+    const pool = createMockPool(client, [makeQr()]);
+    const soroban = createMockSorobanClient({
+      balance: '500000',
+      txHash: 'tx_after_retry',
+      deductFailures: [new Error('socket hang up')],
+    });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [0] });
+
+    const result = await svc.deduct(baseRequest);
+
+    assert.equal(result.success, true);
+    assert.equal(result.stellarTxHash, 'tx_after_retry');
+    assert.equal(soroban.getDeductCount(), 2);
+  });
+
+  test('returns failure with usageEventId when Soroban deduct fails permanently', async () => {
+    // Phase 1 INSERT is committed; Soroban then fails.
+    // The pending row stays in DB for reconciliation.
+    const client = createMockClient([
+      makeQr(), makeQr(), makeQr(), makeQr([{ id: 5 }]), makeQr(),
+    ]);
+    const pool = createMockPool(client);
+    const soroban = createMockSorobanClient({
+      balance: '500000',
+      deductFailures: [new Error('host trap: contract panicked')],
+    });
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
+
+    const result = await svc.deduct(baseRequest);
+
+    assert.equal(result.success, false);
+    assert.ok(result.error?.includes('host trap'));
+    // usageEventId is returned so the pending row can be identified for reconciliation
+    assert.equal(result.usageEventId, '5');
+    assert.equal(soroban.getDeductCount(), 1);
+  });
+});
+
+describe('BillingService.deduct — non-positive quantity rejection', () => {
+  // A pool that fails the test if connect() is ever called, confirming that
+  // invalid-amount requests are rejected before any DB or Soroban work begins.
+  function poolThatMustNotConnect(): Pool {
+    return {
+      connect: async () => {
+        throw new Error('pool.connect() must not be called for non-positive amounts');
+      },
+    } as unknown as Pool;
+  }
+
+  function sorobanThatMustNotBeCalled(): SorobanClient {
+    return {
+      getBalance: async () => {
+        throw new Error('soroban.getBalance() must not be called for non-positive amounts');
+      },
+      deductBalance: async () => {
+        throw new Error('soroban.deductBalance() must not be called for non-positive amounts');
+      },
+    };
+  }
+
+  const rejectCases: Array<[string, string]> = [
+    ['0',           'amountUsdc must be greater than zero'],
+    ['0.0',         'amountUsdc must be greater than zero'],
+    ['0.0000000',   'amountUsdc must be greater than zero'],
+    ['-1',          'amountUsdc must be a positive decimal with at most 7 fractional digits'],
+    ['-0.0000001',  'amountUsdc must be a positive decimal with at most 7 fractional digits'],
+    ['-1.0000000',  'amountUsdc must be a positive decimal with at most 7 fractional digits'],
+    ['',            'amountUsdc must be a positive decimal with at most 7 fractional digits'],
+    ['   ',         'amountUsdc must be a positive decimal with at most 7 fractional digits'],
+    ['NaN',         'amountUsdc must be a positive decimal with at most 7 fractional digits'],
+  ];
+
+  for (const [amountUsdc, expectedError] of rejectCases) {
+    test(`rejects amountUsdc "${amountUsdc}" without touching the DB`, async () => {
+      const billingService = new BillingService(
+        poolThatMustNotConnect(),
+        sorobanThatMustNotBeCalled(),
+        { retryDelaysMs: [] }
+      );
+
+      const result = await billingService.deduct({ ...baseRequest, amountUsdc });
+
+      assert.equal(result.success, false);
+      assert.equal(result.alreadyProcessed, false);
+      assert.equal(result.usageEventId, '');
+      assert.ok(
+        result.error?.includes(expectedError),
+        `expected error to contain "${expectedError}", got "${result.error}"`
+      );
+    });
+  }
+});
+
+describe('BillingService.getByRequestId', () => {
+  test('returns an existing usage event', async () => {
+    const pool = {
+      query: async () => makeQr([{ id: 123, stellar_tx_hash: 'tx_abc' }]),
+    } as unknown as Pool;
+
+    const soroban = createMockSorobanClient();
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
+
+    const result = await svc.getByRequestId('req_existing');
+
+    assert.ok(result !== null);
+    assert.equal(result?.usageEventId, '123');
+    assert.equal(result?.stellarTxHash, 'tx_abc');
+  });
+
+  test('returns null when request_id is absent', async () => {
+    const pool = {
+      query: async () => makeQr(),
+    } as unknown as Pool;
+
+    const soroban = createMockSorobanClient();
+    const svc = new BillingService(pool, soroban.client, { retryDelaysMs: [] });
+
+    const result = await svc.getByRequestId('req_missing');
 
     assert.equal(result, null);
   });

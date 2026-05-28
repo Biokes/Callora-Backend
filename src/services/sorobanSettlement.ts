@@ -1,3 +1,12 @@
+import { config, type StellarNetwork } from '../config/index.js';
+import {
+  withRetry,
+  TransientError,
+  RETRIABLE_HTTP_STATUSES,
+  isTransientNetworkError,
+  type RetryOptions,
+} from '../lib/retry.js';
+
 export interface PayoutResult {
   success: boolean;
   txHash?: string;
@@ -27,11 +36,15 @@ export interface SorobanSimulationRequest {
 }
 
 export interface SorobanRpcSettlementClientOptions {
-  rpcUrl: string;
-  contractId: string;
+  rpcUrl?: string;
+  contractId?: string;
+  network?: StellarNetwork;
   fetchImpl?: typeof fetch;
   requestTimeoutMs?: number;
-  retryDelaysMs?: number[];
+  /** Maximum number of retries after the first attempt. Default: 3. */
+  maxRetries?: number;
+  /** Base delay in ms for exponential backoff. Default: 500. */
+  retryBaseDelayMs?: number;
   requestIdFactory?: () => string;
   sourceAccount?: string;
   networkPassphrase?: string;
@@ -44,6 +57,42 @@ export interface SorobanSettlementClient {
 
 const USDC_STROOPS_MULTIPLIER = 10_000_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_RETRY_BASE_DELAY_MS = 500;
+
+interface ResolvedSorobanRpcSettlementClientOptions
+  extends Omit<SorobanRpcSettlementClientOptions, 'rpcUrl' | 'contractId' | 'networkPassphrase'> {
+  rpcUrl: string;
+  contractId: string;
+  networkPassphrase?: string;
+}
+
+function resolveSorobanRpcOptions(
+  options: SorobanRpcSettlementClientOptions
+): ResolvedSorobanRpcSettlementClientOptions {
+  const selectedNetwork = options.network ?? config.stellar.network;
+
+  if (selectedNetwork !== config.stellar.network) {
+    throw new Error(
+      `Configured network is '${config.stellar.network}' but settlement client requested '${selectedNetwork}'. Cross-network mixing is not allowed.`
+    );
+  }
+
+  const selectedNetworkConfig = config.stellar.networks[selectedNetwork];
+  const contractId = options.contractId ?? selectedNetworkConfig.settlementContractId;
+  if (!contractId) {
+    throw new Error(
+      `Missing settlement contract ID for ${selectedNetwork}. Set STELLAR_${selectedNetwork === 'testnet' ? 'TESTNET' : 'MAINNET'}_SETTLEMENT_CONTRACT_ID.`
+    );
+  }
+
+  return {
+    ...options,
+    rpcUrl: options.rpcUrl ?? selectedNetworkConfig.sorobanRpcUrl,
+    contractId,
+    networkPassphrase: options.networkPassphrase ?? selectedNetworkConfig.networkPassphrase,
+  };
+}
 
 function convertUsdcToStroops(amountUsdc: number): string {
   if (!Number.isFinite(amountUsdc) || amountUsdc <= 0) {
@@ -131,8 +180,10 @@ export function buildSorobanSettlementInvocation(
 
 export class SorobanRpcSettlementClient implements SorobanSettlementClient {
   private readonly fetchImpl: typeof fetch;
+  private readonly resolvedOptions: ResolvedSorobanRpcSettlementClientOptions;
 
   constructor(private readonly options: SorobanRpcSettlementClientOptions) {
+    this.resolvedOptions = resolveSorobanRpcOptions(options);
     this.fetchImpl = options.fetchImpl ?? fetch;
   }
 
@@ -141,7 +192,7 @@ export class SorobanRpcSettlementClient implements SorobanSettlementClient {
 
     try {
       invocation = buildSorobanSettlementInvocation(
-        this.options.contractId,
+        this.resolvedOptions.contractId,
         developerAddress,
         amountUsdc,
       );
@@ -159,17 +210,26 @@ export class SorobanRpcSettlementClient implements SorobanSettlementClient {
       params: {
         invocation,
         sourceAccount: this.options.sourceAccount,
-        networkPassphrase: this.options.networkPassphrase,
+        networkPassphrase: this.resolvedOptions.networkPassphrase,
       },
     };
 
+    const retryOptions: RetryOptions = {
+      maxAttempts: (this.options.maxRetries ?? DEFAULT_MAX_RETRIES) + 1,
+      baseDelayMs: this.options.retryBaseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
+      shouldRetry: isTransientNetworkError,
+    };
+
     try {
-      const response = await this.executeWithRetries(async () => {
+      const response = await withRetry(async () => {
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+        const timeout = setTimeout(
+          () => controller.abort(),
+          this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+        );
 
         try {
-          return await this.fetchImpl(this.options.rpcUrl, {
+          const res = await this.fetchImpl(this.resolvedOptions.rpcUrl, {
             method: 'POST',
             headers: {
               'content-type': 'application/json',
@@ -177,10 +237,18 @@ export class SorobanRpcSettlementClient implements SorobanSettlementClient {
             body: JSON.stringify(requestBody),
             signal: controller.signal,
           });
+
+          // Throw inside the retry scope so transient HTTP errors are retried.
+          // Non-retriable 4xx responses fall through and are handled below.
+          if (RETRIABLE_HTTP_STATUSES.has(res.status)) {
+            throw new TransientError(`Soroban RPC transient error: HTTP ${res.status}`);
+          }
+
+          return res;
         } finally {
           clearTimeout(timeout);
         }
-      });
+      }, retryOptions);
 
       if (!response.ok) {
         return {
@@ -213,26 +281,6 @@ export class SorobanRpcSettlementClient implements SorobanSettlementClient {
         error: `Soroban RPC request failed: ${normalizeSorobanError(error, 'Request failed')}`,
       };
     }
-  }
-
-  private async executeWithRetries<T>(request: () => Promise<T>): Promise<T> {
-    const retryDelays = this.options.retryDelaysMs ?? [];
-
-    let lastError: unknown;
-    for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
-      try {
-        return await request();
-      } catch (error) {
-        lastError = error;
-        if (attempt === retryDelays.length) {
-          break;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
-      }
-    }
-
-    throw lastError;
   }
 
   private getSimulationError(payload: Record<string, unknown>): unknown {

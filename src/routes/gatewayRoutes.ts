@@ -1,108 +1,170 @@
-import { Router, Request, Response } from 'express';
 import { randomUUID } from 'node:crypto';
-import { GatewayDeps } from '../types/gateway.js';
-import { startUpstreamTimer } from '../metrics.js';
+import express, { Router, type Request, type Response, type NextFunction } from 'express';
+import { z } from 'zod';
+import { startUpstreamTimer, type UpstreamOutcome } from '../metrics.js';
+import { validate } from '../middleware/validate.js';
+import type { GatewayDeps } from '../types/gateway.js';
+import { buildHopByHopSet } from '../lib/hopByHop.js';
+import {
+  BadGatewayError,
+  ForbiddenError,
+  GatewayTimeoutError,
+  PaymentRequiredError,
+  TooManyRequestsError,
+  UnauthorizedError,
+} from '../errors/index.js';
 
-const CREDIT_COST_PER_CALL = 1; // cost per proxied request
+const CREDIT_COST_PER_CALL = 1;
+const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_BODY_SIZE = '1mb';
 
-/**
- * Factory that creates the gateway router with injected dependencies.
- * This makes the router fully testable with mocked services.
- */
+const apiIdParamsSchema = z.object({
+  apiId: z.string().min(1, 'API ID is required').max(50, 'API ID too long'),
+});
+
 export function createGatewayRouter(deps: GatewayDeps): Router {
-  const { billing, rateLimiter, usageStore, upstreamUrl, apiKeys } = deps;
+  const { billing, rateLimiter, usageStore, upstreamUrl } = deps;
+  const apiKeys = deps.apiKeys ?? new Map();
+  const maxBodySize = deps.maxBodySize ?? DEFAULT_MAX_BODY_SIZE;
   const router = Router();
 
-  /**
-   * POST /api/gateway/:apiId
-   *
-   * Proxy flow:
-   *   1. Validate API key from x-api-key header
-   *   2. Rate-limit check
-   *   3. Billing deduction (Soroban)
-   *   4. Proxy request to upstream
-   *   5. Record usage event
-   *   6. Return upstream response
-   */
-  router.all('/:apiId', async (req: Request, res: Response) => {
-    // 1. Validate API key
-    const apiKeyHeader = req.headers['x-api-key'] as string | undefined;
-    if (!apiKeyHeader) {
-      res.status(401).json({ error: 'Unauthorized: missing x-api-key header' });
-      return;
-    }
+  // Enforce body size limits at the router level so the gateway is self-contained
+  // regardless of whether a global body parser is present. Oversized bodies surface
+  // as 413 via the app-level error handler.
+  router.use(express.json({ limit: maxBodySize }));
+  router.use(express.urlencoded({ extended: false, limit: maxBodySize }));
 
-    const keyRecord = apiKeys.get(apiKeyHeader);
-    if (!keyRecord || keyRecord.apiId !== req.params.apiId) {
-      res.status(401).json({ error: 'Unauthorized: invalid API key' });
-      return;
-    }
+  router.all(
+    '/:apiId',
+    validate({ params: apiIdParamsSchema }),
+    async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const apiKeyHeader = req.headers['x-api-key'] as string | undefined;
+        const requestId = randomUUID();
 
-    // 2. Rate-limit check
-    const rateResult = rateLimiter.check(apiKeyHeader);
-    if (!rateResult.allowed) {
-      const retryAfterSec = Math.ceil((rateResult.retryAfterMs ?? 1000) / 1000);
-      res.set('Retry-After', String(retryAfterSec));
-      res.status(429).json({ error: 'Too Many Requests', retryAfterMs: rateResult.retryAfterMs });
-      return;
-    }
+        if (!apiKeyHeader) {
+          next(new UnauthorizedError('Unauthorized: missing x-api-key header'));
+          return;
+        }
 
-    // 3. Billing deduction
-    const billingResult = await billing.deductCredit(
-      keyRecord.developerId,
-      CREDIT_COST_PER_CALL,
-    );
-    if (!billingResult.success) {
-      res.status(402).json({
-        error: 'Payment Required: insufficient balance',
-        balance: billingResult.balance,
-      });
-      return;
-    }
+        const keyRecord = apiKeys.get(apiKeyHeader);
+        if (!keyRecord || keyRecord.apiId !== req.params.apiId) {
+          next(new UnauthorizedError('Unauthorized: invalid API key'));
+          return;
+        }
 
-    // 4. Proxy to upstream
-    let upstreamStatus = 502;
-    let upstreamBody: string = '{"error":"Bad Gateway"}';
-    const timer = startUpstreamTimer(req.params.apiId, req.method);
+        if (keyRecord.revoked) {
+          next(new ForbiddenError('Forbidden: API key has been revoked'));
+          return;
+        }
 
-    try {
-      const upstreamRes = await fetch(`${upstreamUrl}${req.path}`, {
-        method: req.method,
-        headers: { 'Content-Type': 'application/json' },
-        body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body),
-      });
+        const rateResult = await rateLimiter.check(apiKeyHeader);
+        if (!rateResult.allowed) {
+          const retryAfterSec = Math.ceil((rateResult.retryAfterMs ?? 1000) / 1000);
+          res.set('Retry-After', String(retryAfterSec));
+          next(new TooManyRequestsError('Too Many Requests'));
+          return;
+        }
 
-      upstreamStatus = upstreamRes.status;
-      upstreamBody = await upstreamRes.text();
-      timer.stop(upstreamStatus, 'success');
-    } catch {
-      upstreamStatus = 502;
-      upstreamBody = JSON.stringify({ error: 'Bad Gateway: upstream unreachable' });
-      timer.stop(upstreamStatus, 'error');
-    }
+        const billingResult = await billing.deductCredit(
+          keyRecord.developerId,
+          CREDIT_COST_PER_CALL,
+        );
+        if (!billingResult.success) {
+          next(new PaymentRequiredError('Payment Required: insufficient balance'));
+          return;
+        }
 
-    // 5. Record usage event
-    usageStore.record({
-      id: randomUUID(),
-      requestId: randomUUID(), // legacy gateway doesn't carry request ID
-      apiKey: apiKeyHeader,
-      apiKeyId: keyRecord.key,
-      apiId: keyRecord.apiId,
-      endpointId: 'legacy',
-      userId: keyRecord.developerId,
-      amountUsdc: CREDIT_COST_PER_CALL,
-      statusCode: upstreamStatus,
-      timestamp: new Date().toISOString(),
-    });
+        let upstreamStatus = 502;
+        let upstreamBody = JSON.stringify({
+          code: 'BAD_GATEWAY',
+          message: 'Bad Gateway: upstream unreachable',
+          requestId,
+        });
+        let upstreamContentType = 'application/json; charset=utf-8';
+        let outcome: UpstreamOutcome = 'error';
+        // Safe upstream response headers to forward (populated on success)
+        const upstreamResponseHeaders: Record<string, string> = {};
+        const timer = startUpstreamTimer(req.params.apiId, req.method);
 
-    // 6. Return upstream response
-    res.status(upstreamStatus);
-    try {
-      res.json(JSON.parse(upstreamBody));
-    } catch {
-      res.send(upstreamBody);
-    }
-  });
+        try {
+          const upstreamRes = await fetch(`${upstreamUrl}${req.path}`, {
+            method: req.method,
+            headers: { 'Content-Type': 'application/json', 'x-request-id': requestId },
+            body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body),
+            signal: AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+          });
+
+          upstreamStatus = upstreamRes.status;
+          upstreamBody = await upstreamRes.text();
+          upstreamContentType =
+            upstreamRes.headers.get('content-type') ?? 'application/octet-stream';
+          outcome = 'success';
+
+          // Collect safe upstream response headers, stripping hop-by-hop headers
+          // (including any names listed in the upstream Connection header value).
+          const upstreamConnection = upstreamRes.headers.get('connection') ?? undefined;
+          const responseStripSet = buildHopByHopSet(upstreamConnection);
+          upstreamRes.headers.forEach((value, key) => {
+            const lower = key.toLowerCase();
+            // Also skip content-type — we set it explicitly below via res.type()
+            if (!responseStripSet.has(lower) && lower !== 'content-type') {
+              upstreamResponseHeaders[key] = value;
+            }
+          });
+        } catch (error) {
+          if (
+            (error instanceof DOMException && error.name === 'TimeoutError') ||
+            (error instanceof TypeError &&
+              (error as NodeJS.ErrnoException).code === 'UND_ERR_CONNECT_TIMEOUT')
+          ) {
+            outcome = 'timeout';
+            timer.stop(504, outcome);
+            throw new GatewayTimeoutError('Upstream service timed out');
+          }
+
+          throw new BadGatewayError('Bad Gateway: upstream unreachable');
+        } finally {
+          if (outcome !== 'timeout') {
+            timer.stop(upstreamStatus, outcome);
+          }
+        }
+
+        await usageStore.record({
+          id: randomUUID(),
+          requestId,
+          apiKey: apiKeyHeader,
+          apiKeyId: keyRecord.key,
+          apiId: keyRecord.apiId,
+          endpointId: 'legacy',
+          userId: keyRecord.developerId,
+          amountUsdc: CREDIT_COST_PER_CALL,
+          statusCode: upstreamStatus,
+          timestamp: new Date().toISOString(),
+        });
+
+        res.set('x-request-id', requestId);
+        // Forward safe upstream response headers (hop-by-hop already stripped above)
+        for (const [key, value] of Object.entries(upstreamResponseHeaders)) {
+          res.set(key, value);
+        }
+        res.status(upstreamStatus);
+
+        if (upstreamContentType.toLowerCase().includes('application/json')) {
+          try {
+            res.type(upstreamContentType).send(JSON.parse(upstreamBody));
+            return;
+          } catch {
+            // Fall through and send raw body with original content type.
+          }
+        }
+
+        res.type(upstreamContentType).send(upstreamBody);
+      } catch (error) {
+        next(error);
+      }
+    },
+  );
 
   return router;
 }

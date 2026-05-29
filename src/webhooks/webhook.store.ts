@@ -1,6 +1,7 @@
-import { WebhookConfig, WebhookEventType } from './webhook.types.js';
+import { WebhookConfig, WebhookEventType, DeadLetterEntry } from './webhook.types.js';
 
 const store = new Map<string, WebhookConfig>();
+const deadLetterStore = new Map<string, DeadLetterEntry>();
 
 export const WebhookStore = {
     register(config: WebhookConfig): void {

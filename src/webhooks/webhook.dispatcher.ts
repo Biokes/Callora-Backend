@@ -1,6 +1,6 @@
-
 import crypto from 'crypto';
-import { WebhookConfig, WebhookPayload } from './webhook.types.js';
+import { WebhookConfig, WebhookPayload, DeadLetterEntry, WebhookDeliveryStatus } from './webhook.types.js';
+import { WebhookStore } from './webhook.store.js';
 import { logger } from '../logger.js';
 
 const MAX_RETRIES = 5;
@@ -10,6 +10,16 @@ const inFlightDispatches = new Set<Promise<void>>();
 
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Calculate exponential backoff with jitter to avoid thundering herd
+function calculateBackoff(attempt: number): number {
+    const exponentialDelay = BASE_DELAY_MS * Math.pow(2, attempt);
+    // Add jitter: random value between 0-25% of the exponential delay
+    const jitter = Math.random() * 0.25 * exponentialDelay;
+    const delayWithJitter = exponentialDelay + jitter;
+    // Cap at maximum delay
+    return Math.min(delayWithJitter, MAX_DELAY_MS);
 }
 
 function signPayload(secret: string, body: string): string {
